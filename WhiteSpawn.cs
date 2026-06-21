@@ -9,14 +9,14 @@ using Newtonsoft.Json;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.0.0")]
+    [Info("WhiteSpawn", "whitecristafer", "1.1.0")]
     [Description("WhiteSpawn - система спавна с безопасной зоной")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869; // SteamID
-        private const string PluginVersion = "1.0.0";
+        private const string PluginVersion = "1.1.0";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
 
         // Access rights
@@ -72,6 +72,10 @@ namespace Oxide.Plugins
         // The flag for the respawn command
         private readonly HashSet<ulong> _respawnCommandFlag = new HashSet<ulong>();
 
+        // zone tracking
+        private Timer _zoneTimer;
+        private readonly HashSet<ulong> _inZoneTracker = new HashSet<ulong>();
+
         #endregion
 
         #region Localization
@@ -104,7 +108,8 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <num> - Set safe zone radius (admin)",
                 ["HelpRespawn"] = "/respawn - Respawn yourself (lose items)",
                 ["HelpStatus"] = "/ws status - Show plugin status",
-                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s"
+                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s",
+                ["LeaveSafeZone"] = "You have left the safe spawn zone. You are now vulnerable!"
             }, this, "en");
 
             // Russian
@@ -133,7 +138,8 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <число> - Установить радиус зоны (админ)",
                 ["HelpRespawn"] = "/respawn - Переродиться (потеря вещей)",
                 ["HelpStatus"] = "/ws status - Показать статус плагина",
-                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с"
+                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с",
+                ["LeaveSafeZone"] = "Вы покинули безопасную зону спавна. Теперь вы уязвимы!"
             }, this, "ru");
         }
 
@@ -162,6 +168,9 @@ namespace Oxide.Plugins
                 TryFindDefaultSpawn();
             }
 
+            // Start tracking players entering and leaving the spawn zone
+            StartZoneTracker();
+
             PrintBanner();
         }
 
@@ -170,6 +179,10 @@ namespace Oxide.Plugins
             SaveSpawnData();
             _firstSpawnDone.Clear();
             _respawnCommandFlag.Clear();
+
+            // Clean up tracking timer and collections to prevent memory leaks
+            _zoneTimer?.Destroy();
+            _inZoneTracker.Clear();
         }
 
         #endregion
@@ -327,12 +340,22 @@ namespace Oxide.Plugins
             if (player == null || !player.IsConnected)
                 return;
 
+            // Clear hostile status immediately to prevent Outpost/Bandit turrets from killing the player
+            if (player.IsHostile())
+            {
+                player.State.unHostileTimestamp = 0;
+                player.ClientRPCPlayer(null, player, "SetHostileLength", 0f);
+            }
+
             // Teleportation sound and effect
             Effect.server.Run("assets/prefabs/misc/transferable/effects/teleport.prefab", player.transform.position, Vector3.up);
 
             player.Teleport(_spawnData.Position);
             player.eyes.rotation = _spawnData.Rotation;
             player.SendNetworkUpdateImmediate();
+
+            // Apply native Rust Safe Zone UI flag instantly
+            player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
 
             SendMessage(player, Lang("SpawnTeleportDone"));
             Effect.server.Run("assets/prefabs/misc/transferable/effects/teleport.prefab", player.transform.position, Vector3.up);
@@ -593,6 +616,51 @@ namespace Oxide.Plugins
         #endregion
 
         #region Helpers
+
+        private void StartZoneTracker()
+        {
+            if (_zoneTimer != null) return;
+
+            // Check player positions every 1 second
+            _zoneTimer = timer.Every(1f, () =>
+            {
+                if (!_spawnData.IsSet || !_config.Settings.Enabled) return;
+
+                foreach (var player in BasePlayer.activePlayerList)
+                {
+                    if (player == null || !player.IsConnected || player.IsDead()) continue;
+
+                    bool inZone = IsInSpawnZone(player.transform.position);
+                    bool wasInZone = _inZoneTracker.Contains(player.userID);
+
+                    if (inZone)
+                    {
+                        if (!wasInZone)
+                        {
+                            _inZoneTracker.Add(player.userID);
+                        }
+                        
+                        // Force native SafeZone UI flag while inside
+                        if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
+                        {
+                            player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
+                            player.SendNetworkUpdateImmediate();
+                        }
+                    }
+                    else if (!inZone && wasInZone)
+                    {
+                        _inZoneTracker.Remove(player.userID);
+                        
+                        // Remove SafeZone UI flag when exiting the custom radius
+                        player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
+                        player.SendNetworkUpdateImmediate();
+
+                        // Notify player that they are vulnerable
+                        SendMessage(player, Lang("LeaveSafeZone"));
+                    }
+                }
+            });
+        }
 
         private bool IsInSpawnZone(Vector3 position)
         {
