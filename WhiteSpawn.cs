@@ -9,14 +9,14 @@ using Newtonsoft.Json;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.1.0")]
+    [Info("WhiteSpawn", "whitecristafer", "1.2.0")]
     [Description("WhiteSpawn - система спавна с безопасной зоной")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869; // SteamID
-        private const string PluginVersion = "1.1.0";
+        private const string PluginVersion = "1.2.0";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
 
         // Access rights
@@ -51,6 +51,8 @@ namespace Oxide.Plugins
             public bool RespawnMessageEnabled = true;
             public bool RespawnCommandEnabled = true;
             public bool FindOutpostFirst = true; // if true, look for Outpost; otherwise, look for Bandit
+            public bool BlockWeaponsAndTools = true; // force-holster weapons/tools while inside the zone
+            public bool FreezeMetabolismInZone = true; // no hunger/thirst/poison/radiation/bleeding loss inside the zone
         }
 
         #endregion
@@ -75,6 +77,7 @@ namespace Oxide.Plugins
         // zone tracking
         private Timer _zoneTimer;
         private readonly HashSet<ulong> _inZoneTracker = new HashSet<ulong>();
+        private readonly Dictionary<ulong, float> _lastWeaponWarn = new Dictionary<ulong, float>();
 
         #endregion
 
@@ -109,7 +112,8 @@ namespace Oxide.Plugins
                 ["HelpRespawn"] = "/respawn - Respawn yourself (lose items)",
                 ["HelpStatus"] = "/ws status - Show plugin status",
                 ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s",
-                ["LeaveSafeZone"] = "You have left the safe spawn zone. You are now vulnerable!"
+                ["LeaveSafeZone"] = "You have left the safe spawn zone. You are now vulnerable!",
+                ["WeaponBlocked"] = "You cannot hold weapons or tools inside the safe zone."
             }, this, "en");
 
             // Russian
@@ -139,7 +143,8 @@ namespace Oxide.Plugins
                 ["HelpRespawn"] = "/respawn - Переродиться (потеря вещей)",
                 ["HelpStatus"] = "/ws status - Показать статус плагина",
                 ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с",
-                ["LeaveSafeZone"] = "Вы покинули безопасную зону спавна. Теперь вы уязвимы!"
+                ["LeaveSafeZone"] = "Вы покинули безопасную зону спавна. Теперь вы уязвимы!",
+                ["WeaponBlocked"] = "В безопасной зоне нельзя держать в руках оружие или инструменты."
             }, this, "ru");
         }
 
@@ -168,8 +173,9 @@ namespace Oxide.Plugins
                 TryFindDefaultSpawn();
             }
 
-            // Start tracking players entering and leaving the spawn zone
-            StartZoneTracker();
+            // Start the periodic in-zone effects ticker (metabolism freeze).
+            // Entering/leaving the zone itself, and the safe-zone flag, are handled per-tick in OnPlayerTick.
+            StartZoneEffectsTimer();
 
             PrintBanner();
         }
@@ -183,6 +189,15 @@ namespace Oxide.Plugins
             // Clean up tracking timer and collections to prevent memory leaks
             _zoneTimer?.Destroy();
             _inZoneTracker.Clear();
+            _lastWeaponWarn.Clear();
+
+            // Make sure nobody is left with the SafeZone flag stuck on if the plugin unloads
+            // while a player is standing inside the zone.
+            foreach (var player in BasePlayer.activePlayerList)
+            {
+                if (player != null && player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
+            }
         }
 
         #endregion
@@ -556,7 +571,13 @@ namespace Oxide.Plugins
         }
 
         // Prohibition of construction in the zone
-        private object CanBuild(Planner plan, Construction prefab, Vector3 position)
+        //
+        // IMPORTANT FIX: the real Oxide hook signature is
+        //   object CanBuild(Planner planner, Construction prefab, Construction.Target target)
+        // The previous version of this method used "Vector3 position" as the third
+        // parameter, which does not match any real hook signature, so Oxide never
+        // actually invoked it - building inside the zone was never blocked.
+        private object CanBuild(Planner plan, Construction prefab, Construction.Target target)
         {
             if (plan == null || !_config.Settings.Enabled)
                 return null;
@@ -568,6 +589,10 @@ namespace Oxide.Plugins
             if (HasAdmin(player))
                 return null;
 
+            // target.position can occasionally be Vector3.zero (e.g. for some socketed
+            // pieces) - fall back to the player's own position in that case.
+            Vector3 position = target.position != Vector3.zero ? target.position : player.transform.position;
+
             if (IsInSpawnZone(position))
             {
                 SendMessage(player, Lang("BuildingBlocked"));
@@ -576,97 +601,145 @@ namespace Oxide.Plugins
             return null;
         }
 
-        // Prohibition of dealing damage to structures
-        private object OnStructureDamage(BuildingBlock block, HitInfo info)
+        // Protection from damage for anything inside the zone (players AND structures).
+        //
+        // IMPORTANT FIX: the previous version split this into two hooks -
+        //   OnStructureDamage(BuildingBlock block, HitInfo info)   <- not a real Oxide hook, never fired
+        //   OnEntityTakeDamage(BasePlayer player, HitInfo info)    <- only ever matched players
+        // The real, generic hook is OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info),
+        // which covers players, building blocks, deployables, vehicles, etc. in one place.
+        private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
-            if (block == null || info == null || !_config.Settings.Enabled)
+            if (entity == null || info == null || !_config.Settings.Enabled)
+                return null;
+
+            if (!IsInSpawnZone(entity.transform.position))
                 return null;
 
             BasePlayer attacker = info.Initiator as BasePlayer;
             if (attacker != null && HasAdmin(attacker))
+                return null; // admins can still deal damage inside the zone
+
+            return false; // block all damage to anything inside the safe zone
+        }
+
+        // Runs on (almost) every player tick - much more frequent than the old 1-second timer.
+        // This is what actually fixes the safe-zone flag "flicker": the flag is re-asserted
+        // continuously instead of only once a second, so there's no longer a visible window
+        // where it can appear to be off. It also force-holsters weapons/tools immediately.
+        //
+        // This must always return null - it only observes/reacts, it never blocks input.
+        private object OnPlayerTick(BasePlayer player, PlayerTick msg, bool wasPlayerStalled)
+        {
+            if (player == null || !_config.Settings.Enabled || !_spawnData.IsSet)
                 return null;
 
-            if (IsInSpawnZone(block.transform.position))
+            if (!player.IsConnected || player.IsDead())
+                return null;
+
+            bool inZone = IsInSpawnZone(player.transform.position);
+            bool wasInZone = _inZoneTracker.Contains(player.userID);
+
+            if (inZone)
             {
-                return false; // prohibiting damage
+                if (!wasInZone)
+                    _inZoneTracker.Add(player.userID);
+
+                if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
+
+                if (_config.Settings.BlockWeaponsAndTools && !HasAdmin(player))
+                    EnforceNoWeapons(player);
             }
+            else if (wasInZone)
+            {
+                _inZoneTracker.Remove(player.userID);
+                player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
+                SendMessage(player, Lang("LeaveSafeZone"));
+            }
+
             return null;
         }
 
-        // Protecting players from damage in the area
-        private object OnEntityTakeDamage(BasePlayer player, HitInfo info)
+        // Cleanup so the tracking collections don't slowly accumulate stale entries
+        private void OnPlayerDisconnected(BasePlayer player, string reason)
         {
-            if (player == null || info == null || !_config.Settings.Enabled)
-                return null;
-
-            // If the player is in the zone, cancel the damage
-            if (IsInSpawnZone(player.transform.position))
-            {
-                // check only if the attacker is not an admin, then damage is prohibited. But if the attacker is an admin, can he do damage? In the requirement "whitespawn.admin can do all of the above" - i.e. the admin can build, break, damage. So if the attacker is an admin, then damage passes. If the attacker is an admin, can he also take damage? But usually the admin can do everything, but the immortality of the zone for everyone except admins? It is better to do this: if the attacker is an admin, then damage is allowed. If the attacker is an admin, but the attacker is not an admin, then damage is prohibited (since the player in the zone is immortal). However, if the attacker is not an admin, and the attacker is an admin, then damage should be prohibited, because the admin is also immortal in the zone? But the admin may wish to take damage? Most likely, the administrator should be able to take damage if he wants, but by condition, the zone gives immortality to everyone except admins? In the condition: "in the established spawn zone, there is a radius of the zone where players are immortal", without exceptions. But further "whitespawn.admin can do all of the above" - i.e. the admin can build, break, damage. This means that the admin can ignore prohibitions, but immortality affects everyone. Probably the admin is also immortal, but can damage others. Therefore, the logic is: if the target is in the zone, then damage is prohibited if the attacker is not an admin. If the attacker is an admin, then damage is allowed (even if the target is in the zone). If the target is not in the zone, then damage is allowed. If the attacker is an admin and the target is in the zone, damage is allowed. Also, if the target is an admin and the attacker is not an admin, then damage is prohibited, since the admin is also in the zone and is immortal.
-                // Implement: if the target is in the zone, and the attacker does not have the right to admin, then we prohibit damage.
-                BasePlayer attacker = info.Initiator as BasePlayer;
-                if (attacker != null && HasAdmin(attacker))
-                    return null; // admin can do damage
-                else
-                    return false; // prohibiting damage
-            }
-            return null;
+            if (player == null) return;
+            _inZoneTracker.Remove(player.userID);
+            _lastWeaponWarn.Remove(player.userID);
         }
 
         #endregion
 
         #region Helpers
 
-        private void StartZoneTracker()
-        {
-            if (_zoneTimer != null) return;
-
-            // Check player positions every 1 second
-            _zoneTimer = timer.Every(1f, () =>
-            {
-                if (!_spawnData.IsSet || !_config.Settings.Enabled) return;
-
-                foreach (var player in BasePlayer.activePlayerList)
-                {
-                    if (player == null || !player.IsConnected || player.IsDead()) continue;
-
-                    bool inZone = IsInSpawnZone(player.transform.position);
-                    bool wasInZone = _inZoneTracker.Contains(player.userID);
-
-                    if (inZone)
-                    {
-                        if (!wasInZone)
-                        {
-                            _inZoneTracker.Add(player.userID);
-                        }
-                        
-                        // Force native SafeZone UI flag while inside
-                        if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
-                        {
-                            player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
-                            player.SendNetworkUpdateImmediate();
-                        }
-                    }
-                    else if (!inZone && wasInZone)
-                    {
-                        _inZoneTracker.Remove(player.userID);
-                        
-                        // Remove SafeZone UI flag when exiting the custom radius
-                        player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
-                        player.SendNetworkUpdateImmediate();
-
-                        // Notify player that they are vulnerable
-                        SendMessage(player, Lang("LeaveSafeZone"));
-                    }
-                }
-            });
-        }
-
         private bool IsInSpawnZone(Vector3 position)
         {
             if (!_spawnData.IsSet)
                 return false;
             return Vector3.Distance(position, _spawnData.Position) <= _config.Settings.Radius;
+        }
+
+        // Periodic ticker that keeps hunger/thirst/poison/radiation/bleeding frozen for
+        // players that OnPlayerTick has already marked as being inside the zone.
+        // This doesn't need per-tick precision, so a 1-second timer is plenty.
+        private void StartZoneEffectsTimer()
+        {
+            if (_zoneTimer != null) return;
+
+            _zoneTimer = timer.Every(1f, () =>
+            {
+                if (!_config.Settings.Enabled || !_config.Settings.FreezeMetabolismInZone) return;
+                if (_inZoneTracker.Count == 0) return;
+
+                foreach (ulong userId in _inZoneTracker)
+                {
+                    BasePlayer player = BasePlayer.FindByID(userId);
+                    if (player == null || !player.IsConnected || player.IsDead()) continue;
+                    ApplyMetabolismFreeze(player);
+                }
+            });
+        }
+
+        // Keeps calories/hydration topped up and zeroes out poison/radiation/bleeding,
+        // so players can't lose health (or get hungry/thirsty) while inside the zone.
+        private void ApplyMetabolismFreeze(BasePlayer player)
+        {
+            PlayerMetabolism metabolism = player.metabolism;
+            if (metabolism == null) return;
+
+            metabolism.calories.value = metabolism.calories.max;
+            metabolism.hydration.value = metabolism.hydration.max;
+            metabolism.poison.value = 0f;
+            metabolism.radiation_poison.value = 0f;
+            metabolism.bleeding.value = 0f;
+
+            player.SendNetworkUpdate(BasePlayer.NetworkQueue.Update);
+        }
+
+        // Force-holsters the player's current item if it's a weapon or tool.
+        // Runs from OnPlayerTick, so this kicks in almost immediately after a player
+        // raises a banned item, rather than fighting the client every single frame.
+        private void EnforceNoWeapons(BasePlayer player)
+        {
+            Item active = player.GetActiveItem();
+            if (!IsRestrictedItem(active))
+                return;
+
+            player.UpdateActiveItem(default(ItemId));
+
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (!_lastWeaponWarn.TryGetValue(player.userID, out float last) || now - last > 5f)
+            {
+                _lastWeaponWarn[player.userID] = now;
+                SendMessage(player, Lang("WeaponBlocked"));
+            }
+        }
+
+        private static bool IsRestrictedItem(Item item)
+        {
+            if (item?.info == null) return false;
+            return item.info.category == ItemCategory.Weapon || item.info.category == ItemCategory.Tool;
         }
 
         private void TryFindDefaultSpawn()
