@@ -9,14 +9,14 @@ using Newtonsoft.Json;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.2.0")]
-    [Description("WhiteSpawn - система спавна с безопасной зоной")]
+    [Info("WhiteSpawn", "whitecristafer", "1.3.0")]
+    [Description("WhiteSpawn - The system is paired with a safe zone")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869; // SteamID
-        private const string PluginVersion = "1.2.0";
+        private const string PluginVersion = "1.3.0";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
 
         // Access rights
@@ -579,6 +579,9 @@ namespace Oxide.Plugins
         // actually invoked it - building inside the zone was never blocked.
         private object CanBuild(Planner plan, Construction prefab, Construction.Target target)
         {
+            if (HasAdmin(player))
+                return null;
+
             if (plan == null || !_config.Settings.Enabled)
                 return null;
 
@@ -645,6 +648,15 @@ namespace Oxide.Plugins
                 if (!wasInZone)
                     _inZoneTracker.Add(player.userID);
 
+                if (!isAdmin)
+                {
+                    if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
+                        player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
+
+                    if (_config.Settings.BlockWeaponsAndTools)
+                        EnforceNoWeapons(player);
+                }
+
                 if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
                     player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
 
@@ -654,8 +666,15 @@ namespace Oxide.Plugins
             else if (wasInZone)
             {
                 _inZoneTracker.Remove(player.userID);
-                player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
-                SendMessage(player, Lang("LeaveSafeZone"));
+
+                if (!isAdmin)
+                {
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
+                    SendMessage(player, Lang("LeaveSafeZone"));
+                } else {
+                    player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
+                    SendMessage(player, Lang("LeaveSafeZone"));
+                }
             }
 
             return null;
@@ -705,6 +724,8 @@ namespace Oxide.Plugins
         // so players can't lose health (or get hungry/thirsty) while inside the zone.
         private void ApplyMetabolismFreeze(BasePlayer player)
         {
+            if (HasAdmin(player)) return;
+
             PlayerMetabolism metabolism = player.metabolism;
             if (metabolism == null) return;
 
