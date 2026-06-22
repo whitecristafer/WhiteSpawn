@@ -579,9 +579,6 @@ namespace Oxide.Plugins
         // actually invoked it - building inside the zone was never blocked.
         private object CanBuild(Planner plan, Construction prefab, Construction.Target target)
         {
-            if (HasAdmin(player))
-                return null;
-
             if (plan == null || !_config.Settings.Enabled)
                 return null;
 
