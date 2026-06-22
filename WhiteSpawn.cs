@@ -645,7 +645,7 @@ namespace Oxide.Plugins
                 if (!wasInZone)
                     _inZoneTracker.Add(player.userID);
 
-                if (!isAdmin)
+                if (!HasAdmin(player))
                 {
                     if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
                         player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
@@ -664,7 +664,7 @@ namespace Oxide.Plugins
             {
                 _inZoneTracker.Remove(player.userID);
 
-                if (!isAdmin)
+                if (!HasAdmin(player))
                 {
                     player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
                     SendMessage(player, Lang("LeaveSafeZone"));
