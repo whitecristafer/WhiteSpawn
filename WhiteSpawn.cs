@@ -1,22 +1,21 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
+using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Plugins;
 using UnityEngine;
-using Newtonsoft.Json;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.3.0")]
+    [Info("WhiteSpawn", "whitecristafer", "1.5.0")]
     [Description("WhiteSpawn - The system is paired with a safe zone")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869; // SteamID
-        private const string PluginVersion = "1.3.0";
+        private const string PluginVersion = "1.5.0";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
 
         // Access rights
@@ -27,9 +26,13 @@ namespace Oxide.Plugins
         // Data paths
         private string _dataPath;
         private string _spawnDataFile;
+        private string _playerDataFile;
 
         // Default teleportation timer
         private const float DefaultSpawnTimer = 5f;
+
+        // Warning cooldown to keep chat readable
+        private const float WarningCooldown = 5f;
 
         #endregion
 
@@ -46,13 +49,25 @@ namespace Oxide.Plugins
         {
             public bool Enabled = true;
             public float SpawnTimer = 5f; // seconds before teleportation
-                public float Radius = 10f; // radius of the safe zone
+            public float Radius = 10f; // radius of the safe zone
+
             public bool WelcomeMessageEnabled = true;
             public bool RespawnMessageEnabled = true;
             public bool RespawnCommandEnabled = true;
+
             public bool FindOutpostFirst = true; // if true, look for Outpost; otherwise, look for Bandit
             public bool BlockWeaponsAndTools = true; // force-holster weapons/tools while inside the zone
             public bool FreezeMetabolismInZone = true; // no hunger/thirst/poison/radiation/bleeding loss inside the zone
+
+            public bool ChatNotificationsEnabled = true; // extra chat feedback for zone actions
+            public bool BlockLootingInZone = true; // players inside the zone cannot be looted
+            public bool BlockBuildingInZone = true; // players cannot build or deploy inside the zone
+            public bool AutoOpenDoorsInZone = true; // nearby doors are opened for players in the zone
+            public float DoorOpenRadius = 2.5f; // near distance for door assistance
+            public float DoorOpenInterval = 0.75f; // throttle for door scanning
+            public float DoorCloseDelay = 3.0f;
+
+            public bool RestoreLogoutPositionOnReconnect = false; // keep players at last logout position on reconnect
         }
 
         #endregion
@@ -60,6 +75,7 @@ namespace Oxide.Plugins
         #region Data
 
         private SpawnData _spawnData;
+        private PlayerData _playerData;
 
         private sealed class SpawnData
         {
@@ -68,16 +84,28 @@ namespace Oxide.Plugins
             public bool IsSet; // is spawn installed manually
         }
 
-        // We store information about a player's first visit
-        private readonly HashSet<ulong> _firstSpawnDone = new HashSet<ulong>();
+        private sealed class PlayerData
+        {
+            public HashSet<ulong> SeenPlayers = new HashSet<ulong>();
+            public Dictionary<ulong, SavedPosition> LogoutPositions = new Dictionary<ulong, SavedPosition>();
+        }
 
-        // The flag for the respawn command
-        private readonly HashSet<ulong> _respawnCommandFlag = new HashSet<ulong>();
+        private sealed class SavedPosition
+        {
+            public Vector3 Position;
+            public Quaternion Rotation;
+        }
 
         // zone tracking
         private Timer _zoneTimer;
+        private Timer _doorTimer;
+        private readonly HashSet<ulong> _respawnCommandFlag = new HashSet<ulong>();
         private readonly HashSet<ulong> _inZoneTracker = new HashSet<ulong>();
         private readonly Dictionary<ulong, float> _lastWeaponWarn = new Dictionary<ulong, float>();
+        private readonly Dictionary<ulong, float> _lastLootWarn = new Dictionary<ulong, float>();
+        private readonly Dictionary<ulong, float> _lastBuildWarn = new Dictionary<ulong, float>();
+        private readonly Dictionary<ulong, float> _lastDamageWarn = new Dictionary<ulong, float>();
+        private readonly Dictionary<ulong, float> _lastDoorPulse = new Dictionary<ulong, float>();
 
         #endregion
 
@@ -101,8 +129,13 @@ namespace Oxide.Plugins
                 ["RespawnMessage"] = "You have been respawned to the safe spawn zone.",
                 ["RespawnCommandUsed"] = "You have been respawned (items lost).",
                 ["CannotSpawnHostile"] = "You are hostile. Please wait until hostility ends.",
-                ["BuildingBlocked"] = "You cannot build in the safe zone.",
-                ["DamageBlocked"] = "You cannot deal damage in the safe zone.",
+                ["BuildingBlocked"] = "You cannot build or deploy in the safe zone.",
+                ["LootBlocked"] = "You cannot loot players inside the safe zone.",
+                ["DamageBlocked"] = "Damage is blocked inside the safe zone.",
+                ["EnteredSafeZone"] = "You entered the safe spawn zone.",
+                ["LeaveSafeZone"] = "You have left the safe spawn zone. You are now vulnerable!",
+                ["WeaponBlocked"] = "You cannot hold weapons or tools inside the safe zone.",
+                ["LogoutPositionRestored"] = "Your last logout position has been restored.",
                 ["AdminBypass"] = "Admin bypass active.",
                 ["InvalidCommand"] = "Unknown command. Use /spawn or /ws help.",
                 ["HelpHeader"] = "WhiteSpawn Commands:",
@@ -111,9 +144,7 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <num> - Set safe zone radius (admin)",
                 ["HelpRespawn"] = "/respawn - Respawn yourself (lose items)",
                 ["HelpStatus"] = "/ws status - Show plugin status",
-                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s",
-                ["LeaveSafeZone"] = "You have left the safe spawn zone. You are now vulnerable!",
-                ["WeaponBlocked"] = "You cannot hold weapons or tools inside the safe zone."
+                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s, Restore Logout Position: {3}, Door Assist: {4}, Chat Notices: {5}",
             }, this, "en");
 
             // Russian
@@ -132,8 +163,13 @@ namespace Oxide.Plugins
                 ["RespawnMessage"] = "Вы были респавнены в безопасную зону спавна.",
                 ["RespawnCommandUsed"] = "Вы переродились (вещи потеряны).",
                 ["CannotSpawnHostile"] = "Вы враждебны. Подождите окончания враждебности.",
-                ["BuildingBlocked"] = "Вы не можете строить в безопасной зоне.",
-                ["DamageBlocked"] = "Вы не можете наносить урон в безопасной зоне.",
+                ["BuildingBlocked"] = "Вы не можете строить или ставить предметы в безопасной зоне.",
+                ["LootBlocked"] = "В безопасной зоне нельзя лутать игроков.",
+                ["DamageBlocked"] = "Урон в безопасной зоне заблокирован.",
+                ["EnteredSafeZone"] = "Вы вошли в безопасную зону спавна.",
+                ["LeaveSafeZone"] = "Вы покинули безопасную зону спавна. Теперь вы уязвимы!",
+                ["WeaponBlocked"] = "В безопасной зоне нельзя держать в руках оружие или инструменты.",
+                ["LogoutPositionRestored"] = "Ваша последняя точка выхода восстановлена.",
                 ["AdminBypass"] = "Администратор имеет право на обход.",
                 ["InvalidCommand"] = "Неизвестная команда. Используйте /spawn или /ws help.",
                 ["HelpHeader"] = "Команды WhiteSpawn:",
@@ -142,9 +178,7 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <число> - Установить радиус зоны (админ)",
                 ["HelpRespawn"] = "/respawn - Переродиться (потеря вещей)",
                 ["HelpStatus"] = "/ws status - Показать статус плагина",
-                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с",
-                ["LeaveSafeZone"] = "Вы покинули безопасную зону спавна. Теперь вы уязвимы!",
-                ["WeaponBlocked"] = "В безопасной зоне нельзя держать в руках оружие или инструменты."
+                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с, Возврат на выход: {3}, Авто-движение дверей: {4}, Чат-уведомления: {5}",
             }, this, "ru");
         }
 
@@ -162,6 +196,7 @@ namespace Oxide.Plugins
         {
             LoadConfig();
             LoadSpawnData();
+            LoadPlayerData();
             RegisterCommands();
         }
 
@@ -169,13 +204,13 @@ namespace Oxide.Plugins
         {
             // If the spawn is not set, we will try to find an Outpost or Bandit automatically
             if (!_spawnData.IsSet)
-            {
                 TryFindDefaultSpawn();
-            }
 
             // Start the periodic in-zone effects ticker (metabolism freeze).
             // Entering/leaving the zone itself, and the safe-zone flag, are handled per-tick in OnPlayerTick.
             StartZoneEffectsTimer();
+            StartDoorMonitorTimer();
+            CloseAllDoorsInZone();
 
             PrintBanner();
         }
@@ -183,13 +218,18 @@ namespace Oxide.Plugins
         private void Unload()
         {
             SaveSpawnData();
-            _firstSpawnDone.Clear();
-            _respawnCommandFlag.Clear();
+            SavePlayerData();
 
-            // Clean up tracking timer and collections to prevent memory leaks
+            _doorTimer?.Destroy();
+
             _zoneTimer?.Destroy();
+
             _inZoneTracker.Clear();
             _lastWeaponWarn.Clear();
+            _lastLootWarn.Clear();
+            _lastBuildWarn.Clear();
+            _lastDamageWarn.Clear();
+            _lastDoorPulse.Clear();
 
             // Make sure nobody is left with the SafeZone flag stuck on if the plugin unloads
             // while a player is standing inside the zone.
@@ -237,6 +277,9 @@ namespace Oxide.Plugins
             // Conversion of values
             if (_config.Settings.SpawnTimer <= 0) _config.Settings.SpawnTimer = DefaultSpawnTimer;
             if (_config.Settings.Radius <= 0) _config.Settings.Radius = 10f;
+            if (_config.Settings.DoorOpenRadius <= 0) _config.Settings.DoorOpenRadius = 2.5f;
+            if (_config.Settings.DoorOpenInterval < 0.1f) _config.Settings.DoorOpenInterval = 0.75f;
+            if (_config.Settings.DoorCloseDelay <= 0f) _config.Settings.DoorCloseDelay = 3.0f;
 
             SaveConfig();
         }
@@ -253,6 +296,8 @@ namespace Oxide.Plugins
         {
             _dataPath = Path.Combine(Interface.Oxide.DataDirectory, Name);
             _spawnDataFile = Path.Combine(_dataPath, "spawn.json");
+            _playerDataFile = Path.Combine(_dataPath, "players.json");
+
             if (!Directory.Exists(_dataPath))
                 Directory.CreateDirectory(_dataPath);
         }
@@ -276,6 +321,9 @@ namespace Oxide.Plugins
             {
                 _spawnData = new SpawnData { IsSet = false };
             }
+
+            if (_spawnData == null)
+                _spawnData = new SpawnData { IsSet = false };
         }
 
         private void SaveSpawnData()
@@ -288,6 +336,49 @@ namespace Oxide.Plugins
             catch (Exception ex)
             {
                 PrintError($"Failed to save spawn data: {ex.Message}");
+            }
+        }
+
+        private void LoadPlayerData()
+        {
+            if (File.Exists(_playerDataFile))
+            {
+                try
+                {
+                    string json = File.ReadAllText(_playerDataFile);
+                    _playerData = JsonConvert.DeserializeObject<PlayerData>(json);
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Failed to load player data: {ex.Message}");
+                    _playerData = new PlayerData();
+                }
+            }
+            else
+            {
+                _playerData = new PlayerData();
+            }
+
+            if (_playerData == null)
+                _playerData = new PlayerData();
+
+            if (_playerData.SeenPlayers == null)
+                _playerData.SeenPlayers = new HashSet<ulong>();
+
+            if (_playerData.LogoutPositions == null)
+                _playerData.LogoutPositions = new Dictionary<ulong, SavedPosition>();
+        }
+
+        private void SavePlayerData()
+        {
+            try
+            {
+                string json = JsonConvert.SerializeObject(_playerData, Formatting.Indented);
+                File.WriteAllText(_playerDataFile, json);
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Failed to save player data: {ex.Message}");
             }
         }
 
@@ -341,16 +432,17 @@ namespace Oxide.Plugins
                             SendMessage(player, Lang("SpawnTeleportCancel"));
                         return;
                     }
-                    DoTeleport(player);
+
+                    DoTeleportToSpawn(player);
                 });
             }
             else
             {
-                DoTeleport(player);
+                DoTeleportToSpawn(player);
             }
         }
 
-        private void DoTeleport(BasePlayer player)
+        private void DoTeleportToSpawn(BasePlayer player)
         {
             if (player == null || !player.IsConnected)
                 return;
@@ -373,6 +465,23 @@ namespace Oxide.Plugins
             player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
 
             SendMessage(player, Lang("SpawnTeleportDone"));
+            Effect.server.Run("assets/prefabs/misc/transferable/effects/teleport.prefab", player.transform.position, Vector3.up);
+        }
+
+        private void TeleportToSavedPosition(BasePlayer player, SavedPosition saved)
+        {
+            if (player == null || saved == null || !player.IsConnected)
+                return;
+
+            Effect.server.Run("assets/prefabs/misc/transferable/effects/teleport.prefab", player.transform.position, Vector3.up);
+
+            player.Teleport(saved.Position);
+            player.eyes.rotation = saved.Rotation;
+            player.SendNetworkUpdateImmediate();
+
+            player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, IsInSpawnZone(saved.Position));
+
+            SendZoneMessage(player, Lang("LogoutPositionRestored"));
             Effect.server.Run("assets/prefabs/misc/transferable/effects/teleport.prefab", player.transform.position, Vector3.up);
         }
 
@@ -426,7 +535,15 @@ namespace Oxide.Plugins
                     break;
 
                 case "status":
-                    string status = string.Format(Lang("Status"), _config.Settings.Enabled, _config.Settings.Radius, _config.Settings.SpawnTimer);
+                    string status = string.Format(
+                        Lang("Status"),
+                        _config.Settings.Enabled,
+                        _config.Settings.Radius,
+                        _config.Settings.SpawnTimer,
+                        _config.Settings.RestoreLogoutPositionOnReconnect,
+                        _config.Settings.AutoOpenDoorsInZone,
+                        _config.Settings.ChatNotificationsEnabled
+                    );
                     SendMessage(player, status);
                     break;
 
@@ -466,13 +583,12 @@ namespace Oxide.Plugins
 
             // Killing the player
             player.Die();
+
             // Forced respawn after 0.1 seconds (if it doesn't work automatically)
             timer.Once(0.1f, () =>
             {
                 if (player != null && player.IsConnected && player.IsDead())
-                {
                     player.Respawn();
-                }
             });
         }
 
@@ -480,16 +596,19 @@ namespace Oxide.Plugins
 
         #region Hooks
 
-        // When a player logs in (for the first time)
+        // When a player logs in
         private void OnPlayerConnected(BasePlayer player)
         {
             if (player == null || !_config.Settings.Enabled)
                 return;
 
-            // Check if the player has already been on the server
-            if (!_firstSpawnDone.Contains(player.userID))
+            bool seenBefore = _playerData.SeenPlayers.Contains(player.userID);
+
+            if (!seenBefore)
             {
-                _firstSpawnDone.Add(player.userID);
+                _playerData.SeenPlayers.Add(player.userID);
+                SavePlayerData();
+
                 // If the player has bypass permission, don't teleport
                 if (HasBypassSpawn(player) || HasAdmin(player))
                     return;
@@ -501,9 +620,9 @@ namespace Oxide.Plugins
                     {
                         if (player != null && player.IsConnected)
                         {
-                            DoTeleport(player);
+                            DoTeleportToSpawn(player);
                             if (_config.Settings.WelcomeMessageEnabled)
-                                SendMessage(player, Lang("WelcomeMessage"));
+                                SendZoneMessage(player, Lang("WelcomeMessage"));
                         }
                     });
                 }
@@ -517,14 +636,55 @@ namespace Oxide.Plugins
                         {
                             if (player != null && player.IsConnected)
                             {
-                                DoTeleport(player);
+                                DoTeleportToSpawn(player);
                                 if (_config.Settings.WelcomeMessageEnabled)
-                                    SendMessage(player, Lang("WelcomeMessage"));
+                                    SendZoneMessage(player, Lang("WelcomeMessage"));
                             }
                         });
                     }
                 }
+
+                return;
             }
+
+            if (HasBypassSpawn(player) || HasAdmin(player))
+                return;
+
+            if (_config.Settings.RestoreLogoutPositionOnReconnect && _playerData.LogoutPositions.TryGetValue(player.userID, out SavedPosition saved))
+            {
+                timer.Once(0.5f, () =>
+                {
+                    if (player != null && player.IsConnected)
+                        TeleportToSavedPosition(player, saved);
+                });
+            }
+        }
+
+        // Save last known position so reconnects can be restored if the option is enabled.
+        private void OnPlayerDisconnected(BasePlayer player, string reason)
+        {
+            if (player == null)
+                return;
+
+            _inZoneTracker.Remove(player.userID);
+            _lastWeaponWarn.Remove(player.userID);
+            _lastLootWarn.Remove(player.userID);
+            _lastBuildWarn.Remove(player.userID);
+            _lastDamageWarn.Remove(player.userID);
+            _lastDoorPulse.Remove(player.userID);
+
+            if (!_config.Settings.Enabled || player.IsDead())
+                return;
+
+            if (!_config.Settings.RestoreLogoutPositionOnReconnect)
+                return;
+
+            _playerData.LogoutPositions[player.userID] = new SavedPosition
+            {
+                Position = player.transform.position,
+                Rotation = player.eyes.rotation
+            };
+            SavePlayerData();
         }
 
         // After death (respawn)
@@ -544,7 +704,7 @@ namespace Oxide.Plugins
                     {
                         if (player != null && player.IsConnected)
                         {
-                            DoTeleport(player);
+                            DoTeleportToSpawn(player);
                             SendMessage(player, Lang("RespawnCommandUsed"));
                         }
                     });
@@ -562,52 +722,69 @@ namespace Oxide.Plugins
                 {
                     if (player != null && player.IsConnected)
                     {
-                        DoTeleport(player);
+                        DoTeleportToSpawn(player);
                         if (_config.Settings.RespawnMessageEnabled)
-                            SendMessage(player, Lang("RespawnMessage"));
+                            SendZoneMessage(player, Lang("RespawnMessage"));
                     }
                 });
             }
         }
 
-        // Prohibition of construction in the zone
-        //
-        // IMPORTANT FIX: the real Oxide hook signature is
-        //   object CanBuild(Planner planner, Construction prefab, Construction.Target target)
-        // The previous version of this method used "Vector3 position" as the third
-        // parameter, which does not match any real hook signature, so Oxide never
-        // actually invoked it - building inside the zone was never blocked.
+        // Prohibition of construction in the zone.
+        // This hook blocks the placement before the entity even exists.
         private object CanBuild(Planner plan, Construction prefab, Construction.Target target)
         {
-            if (plan == null || !_config.Settings.Enabled)
+            if (plan == null || !_config.Settings.Enabled || !_config.Settings.BlockBuildingInZone)
                 return null;
 
             BasePlayer player = plan.GetOwnerPlayer();
             if (player == null)
                 return null;
-
+            
             if (HasAdmin(player))
                 return null;
 
-            // target.position can occasionally be Vector3.zero (e.g. for some socketed
-            // pieces) - fall back to the player's own position in that case.
+            // target.position can occasionally be Vector3.zero (e.g. for some socketed pieces) - fall back to the player's own position in that case.
             Vector3 position = target.position != Vector3.zero ? target.position : player.transform.position;
+            bool isAttachedToZoneEntity = target.entity != null && IsInSpawnZone(target.entity.transform.position);
 
-            if (IsInSpawnZone(position))
+            if (IsInSpawnZone(position) || IsInSpawnZone(player.transform.position) || isAttachedToZoneEntity)
             {
-                SendMessage(player, Lang("BuildingBlocked"));
+                WarnBuildBlocked(player);
                 return false;
             }
+
             return null;
         }
 
+        // Extra catch for deployables and edge cases where a piece slips through CanBuild.
+        private void OnEntityBuilt(Planner plan, GameObject gameObject)
+        {
+            if (plan == null || gameObject == null || !_config.Settings.Enabled || !_config.Settings.BlockBuildingInZone)
+                return;
+
+            BasePlayer player = plan.GetOwnerPlayer();
+
+            if (HasAdmin(player))
+                    return;
+
+            BaseEntity entity = gameObject.GetComponent<BaseEntity>();
+            if (player == null || entity == null || entity.IsDestroyed)
+                return;
+
+            if (IsInSpawnZone(player.transform.position) || IsInSpawnZone(entity.transform.position))
+            {
+                WarnBuildBlocked(player);
+                NextTick(() =>
+                {
+                    if (entity != null && !entity.IsDestroyed)
+                        entity.Kill();
+                });
+            }
+        }
+
         // Protection from damage for anything inside the zone (players AND structures).
-        //
-        // IMPORTANT FIX: the previous version split this into two hooks -
-        //   OnStructureDamage(BuildingBlock block, HitInfo info)   <- not a real Oxide hook, never fired
-        //   OnEntityTakeDamage(BasePlayer player, HitInfo info)    <- only ever matched players
-        // The real, generic hook is OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info),
-        // which covers players, building blocks, deployables, vehicles, etc. in one place.
+        // The zone is treated as hard safe-state: no damage exceptions.
         private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
             if (entity == null || info == null || !_config.Settings.Enabled)
@@ -616,19 +793,80 @@ namespace Oxide.Plugins
             if (!IsInSpawnZone(entity.transform.position))
                 return null;
 
-            BasePlayer attacker = info.Initiator as BasePlayer;
-            if (attacker != null && HasAdmin(attacker))
-                return null; // admins can still deal damage inside the zone
+            if (entity is BasePlayer victim)
+            {
+                float now = UnityEngine.Time.realtimeSinceStartup;
+                if (TryWarn(_lastDamageWarn, victim.userID, now, WarningCooldown))
+                    SendZoneMessage(victim, Lang("DamageBlocked"));
+            }
 
             return false; // block all damage to anything inside the safe zone
         }
 
+        // Blocks looting of players that are inside the safe zone.
+        private object CanLootPlayer(BasePlayer target, BasePlayer looter)
+        {
+            if (!_config.Settings.Enabled || !_config.Settings.BlockLootingInZone)
+                return null;
+
+            if (target == null || looter == null)
+                return null;
+
+            bool targetProtected = IsInSpawnZone(target.transform.position);
+            bool looterProtected = IsInSpawnZone(looter.transform.position);
+
+            if (!targetProtected && !looterProtected)
+                return null;
+
+            WarnLootBlocked(looter);
+            return false;
+        }
+
+        // Some inventory looting paths use the generic entity loot hook.
+        private object CanLootEntity(BasePlayer looter, BaseEntity entity)
+        {
+            if (!_config.Settings.Enabled || !_config.Settings.BlockLootingInZone)
+                return null;
+
+            if (looter == null || entity == null)
+                return null;
+
+            // If they try to trick a live player
+            if (entity is BasePlayer target)
+            {
+                if (IsInSpawnZone(target.transform.position) || IsInSpawnZone(looter.transform.position))
+                {
+                    WarnLootBlocked(looter);
+                    return false;
+                }
+            }
+
+            // If they try to hide the player's corpse (PlayerCorpse)
+            if (entity is PlayerCorpse corpse)
+            {
+                // We check whether the corpse or the loot is in a safe zone.
+                if (IsInSpawnZone(corpse.transform.position) || IsInSpawnZone(looter.transform.position))
+                {
+                    // If the looter is not the owner of this corpse block the loot
+                    if (corpse.playerSteamID != looter.userID)
+                    {
+                        WarnLootBlocked(looter);
+                        return false;
+                    }
+                }
+            }
+
+            if (IsInSpawnZone(looter.transform.position) && entity is BasePlayer)
+            {
+                WarnLootBlocked(looter);
+                return false;
+            }
+
+            return null;
+        }
+
         // Runs on (almost) every player tick - much more frequent than the old 1-second timer.
-        // This is what actually fixes the safe-zone flag "flicker": the flag is re-asserted
-        // continuously instead of only once a second, so there's no longer a visible window
-        // where it can appear to be off. It also force-holsters weapons/tools immediately.
-        //
-        // This must always return null - it only observes/reacts, it never blocks input.
+        // This keeps the safe-zone flag stable, forces restricted items away, and can assist doors.
         private object OnPlayerTick(BasePlayer player, PlayerTick msg, bool wasPlayerStalled)
         {
             if (player == null || !_config.Settings.Enabled || !_spawnData.IsSet)
@@ -643,46 +881,39 @@ namespace Oxide.Plugins
             if (inZone)
             {
                 if (!wasInZone)
-                    _inZoneTracker.Add(player.userID);
-
-                if (!HasAdmin(player))
                 {
-                    if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
-                        player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
-
-                    if (_config.Settings.BlockWeaponsAndTools)
-                        EnforceNoWeapons(player);
+                    _inZoneTracker.Add(player.userID);
+                    SendZoneMessage(player, Lang("EnteredSafeZone"));
                 }
 
                 if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
                     player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, true);
 
-                if (_config.Settings.BlockWeaponsAndTools && !HasAdmin(player))
+                if (_config.Settings.BlockWeaponsAndTools)
                     EnforceNoWeapons(player);
+
+                if (_config.Settings.FreezeMetabolismInZone)
+                    ApplyMetabolismFreeze(player);
+
+                if (_config.Settings.AutoOpenDoorsInZone)
+                    TryOpenNearbyDoors(player);
             }
             else if (wasInZone)
             {
                 _inZoneTracker.Remove(player.userID);
 
-                if (!HasAdmin(player))
-                {
+                if (player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
                     player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
-                    SendMessage(player, Lang("LeaveSafeZone"));
-                } else {
-                    player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
-                    SendMessage(player, Lang("LeaveSafeZone"));
-                }
+
+                SendZoneMessage(player, Lang("LeaveSafeZone"));
+            }
+            else if (player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
+            {
+                // Keep the flag aligned even if the player was moved by another plugin.
+                player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
             }
 
             return null;
-        }
-
-        // Cleanup so the tracking collections don't slowly accumulate stale entries
-        private void OnPlayerDisconnected(BasePlayer player, string reason)
-        {
-            if (player == null) return;
-            _inZoneTracker.Remove(player.userID);
-            _lastWeaponWarn.Remove(player.userID);
         }
 
         #endregion
@@ -693,12 +924,12 @@ namespace Oxide.Plugins
         {
             if (!_spawnData.IsSet)
                 return false;
+
             return Vector3.Distance(position, _spawnData.Position) <= _config.Settings.Radius;
         }
 
         // Periodic ticker that keeps hunger/thirst/poison/radiation/bleeding frozen for
         // players that OnPlayerTick has already marked as being inside the zone.
-        // This doesn't need per-tick precision, so a 1-second timer is plenty.
         private void StartZoneEffectsTimer()
         {
             if (_zoneTimer != null) return;
@@ -721,8 +952,6 @@ namespace Oxide.Plugins
         // so players can't lose health (or get hungry/thirsty) while inside the zone.
         private void ApplyMetabolismFreeze(BasePlayer player)
         {
-            if (HasAdmin(player)) return;
-
             PlayerMetabolism metabolism = player.metabolism;
             if (metabolism == null) return;
 
@@ -747,17 +976,145 @@ namespace Oxide.Plugins
             player.UpdateActiveItem(default(ItemId));
 
             float now = UnityEngine.Time.realtimeSinceStartup;
-            if (!_lastWeaponWarn.TryGetValue(player.userID, out float last) || now - last > 5f)
-            {
-                _lastWeaponWarn[player.userID] = now;
-                SendMessage(player, Lang("WeaponBlocked"));
-            }
+            if (TryWarn(_lastWeaponWarn, player.userID, now, WarningCooldown))
+                SendZoneMessage(player, Lang("WeaponBlocked"));
         }
 
         private static bool IsRestrictedItem(Item item)
         {
             if (item?.info == null) return false;
             return item.info.category == ItemCategory.Weapon || item.info.category == ItemCategory.Tool;
+        }
+
+        // Method for forcibly closing all doors on the spawn (called at startup)
+        private void CloseAllDoorsInZone()
+        {
+            if (!_spawnData.IsSet || !_config.Settings.AutoOpenDoorsInZone) return;
+
+            Collider[] colliders = Physics.OverlapSphere(_spawnData.Position, _config.Settings.Radius, ~0, QueryTriggerInteraction.Collide);
+            if (colliders == null || colliders.Length == 0) return;
+
+            HashSet<Door> processed = new HashSet<Door>();
+
+            for (int i = 0; i < colliders.Length; i++)
+            {
+                Collider collider = colliders[i];
+                if (collider == null) continue;
+
+                Door door = collider.GetComponentInParent<Door>();
+                if (door == null || door.IsDestroyed || !door.IsOpen() || processed.Contains(door))
+                    continue;
+
+                processed.Add(door);
+                door.SetOpen(false, true);
+            }
+        }
+
+        // Global timer: checks ALL open doors within the spawn radius once per second
+        private void StartDoorMonitorTimer()
+        {
+            if (_doorTimer != null) return;
+
+            _doorTimer = timer.Every(1f, () =>
+            {
+                if (!_config.Settings.Enabled || !_config.Settings.AutoOpenDoorsInZone || !_spawnData.IsSet) return;
+
+                // We find absolutely all objects in the spawn zone
+                Collider[] colliders = Physics.OverlapSphere(_spawnData.Position, _config.Settings.Radius, ~0, QueryTriggerInteraction.Collide);
+                if (colliders == null || colliders.Length == 0) return;
+
+                HashSet<Door> processedDoors = new HashSet<Door>();
+                float checkRadius = _config.Settings.DoorOpenRadius;
+
+                for (int i = 0; i < colliders.Length; i++)
+                {
+                    Collider collider = colliders[i];
+                    if (collider == null) continue;
+
+                    Door door = collider.GetComponentInParent<Door>();
+                    // We are only interested in OPEN doors that we haven't checked yet in this cycle
+                    if (door == null || door.IsDestroyed || !door.IsOpen() || processedDoors.Contains(door))
+                        continue;
+
+                    processedDoors.Add(door);
+
+                    // We check for the presence of living players within the radius of this specific door (layer 17 — Player_Server)
+                    Collider[] doorColliders = Physics.OverlapSphere(door.transform.position, checkRadius, 1 << 17, QueryTriggerInteraction.Collide);
+                    bool playerNearby = false;
+
+                    if (doorColliders != null)
+                    {
+                        for (int j = 0; j < doorColliders.Length; j++)
+                        {
+                            BasePlayer nearbyPlayer = doorColliders[j].GetComponentInParent<BasePlayer>();
+                            if (nearbyPlayer != null && nearbyPlayer.IsConnected && !nearbyPlayer.IsDead())
+                            {
+                                playerNearby = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // If there are no players near the open door — forcibly close it
+                    if (!playerNearby)
+                    {
+                        door.SetOpen(false, true);
+                    }
+                }
+            });
+        }
+
+        private void TryOpenNearbyDoors(BasePlayer player)
+        {
+            if (player == null || !_config.Settings.AutoOpenDoorsInZone)
+                return;
+
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (!TryWarn(_lastDoorPulse, player.userID, now, _config.Settings.DoorOpenInterval))
+                return;
+
+            Collider[] colliders = Physics.OverlapSphere(player.transform.position, _config.Settings.DoorOpenRadius, ~0, QueryTriggerInteraction.Collide);
+            if (colliders == null || colliders.Length == 0)
+                return;
+
+            for (int i = 0; i < colliders.Length; i++)
+            {
+                Collider collider = colliders[i];
+                if (collider == null)
+                    continue;
+
+                Door door = collider.GetComponentInParent<Door>();
+                if (door == null || door.IsDestroyed || door.IsOpen())
+                    continue;
+
+                door.SetOpen(true, true);
+            }
+        }
+
+        private void WarnLootBlocked(BasePlayer player)
+        {
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (TryWarn(_lastLootWarn, player.userID, now, WarningCooldown))
+                SendZoneMessage(player, Lang("LootBlocked"));
+        }
+
+        private void WarnBuildBlocked(BasePlayer player)
+        {
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (TryWarn(_lastBuildWarn, player.userID, now, WarningCooldown))
+                SendZoneMessage(player, Lang("BuildingBlocked"));
+        }
+
+        private bool TryWarn(Dictionary<ulong, float> storage, ulong userId, float now, float cooldown)
+        {
+            if (storage == null)
+                return true;
+
+            if (storage.TryGetValue(userId, out float last) && now - last < cooldown)
+                return false;
+
+            storage[userId] = now;
+            return true;
         }
 
         private void TryFindDefaultSpawn()
@@ -770,15 +1127,15 @@ namespace Oxide.Plugins
                 // If Outpost is not found, search for Bandit
                 obj = GameObject.Find("assets/bundled/prefabs/static/bandit_town.prefab");
             }
+
             if (obj == null)
             {
                 PrintWarning("Default spawn (Outpost/Bandit) not found. Please set spawn manually.");
                 return;
             }
 
-            // Do we take the center or a random point? It is better to take a spawn position inside (for example, the center)
+            // We take the center and lift it a little so the player doesn't get stuck in terrain.
             Vector3 pos = obj.transform.position;
-            // You can add a Y offset to avoid being underground
             pos.y += 1f;
 
             _spawnData.Position = pos;
@@ -797,6 +1154,14 @@ namespace Oxide.Plugins
             player.SendConsoleCommand("chat.add", 2, PluginIcon, final);
         }
 
+        private void SendZoneMessage(BasePlayer player, string message)
+        {
+            if (!_config.Settings.ChatNotificationsEnabled)
+                return;
+
+            SendMessage(player, message);
+        }
+
         private string Lang(string key, params object[] args)
         {
             string msg = lang.GetMessage(key, this);
@@ -811,6 +1176,7 @@ namespace Oxide.Plugins
             Puts($"{Name} loaded successfully.");
             Puts($"Version: {PluginVersion}");
             Puts($"Spawn set: {_spawnData.IsSet}, Radius: {_config.Settings.Radius}, Timer: {_config.Settings.SpawnTimer}s");
+            Puts($"Reconnect restore: {_config.Settings.RestoreLogoutPositionOnReconnect}, Door assist: {_config.Settings.AutoOpenDoorsInZone}, Chat notices: {_config.Settings.ChatNotificationsEnabled}");
             Puts("==================================================");
         }
 
