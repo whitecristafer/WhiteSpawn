@@ -8,14 +8,14 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.5.1")]
-    [Description("WhiteSpawn - The system is paired with a safe zone")]
+    [Info("WhiteSpawn", "whitecristafer", "1.6.2")]
+    [Description("WhiteSpawn - Advanced safe zone system with decay prevention and powerless devices support")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869;
-        private const string PluginVersion = "1.5.1";
+        private const string PluginVersion = "1.6.2";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
         private const string AdminPermission = "whitespawn.admin";
         private const string BypassTimerPermission = "whitespawn.bypasstimer";
@@ -61,6 +61,10 @@ namespace Oxide.Plugins
             public float DoorOpenInterval { get; set; } = 0.75f;
             public float DoorCloseDelay { get; set; } = 3.0f;
             public bool RestoreLogoutPositionOnReconnect { get; set; } = false;
+            // Developer: Advanced features for respawn and building management
+            public bool RespawnOnlyByCommand { get; set; } = true;
+            public bool PreventBuildingDecay { get; set; } = true;
+            public bool PowerlessDevicesEnabled { get; set; } = false;
         }
 
         #endregion
@@ -92,6 +96,7 @@ namespace Oxide.Plugins
         // Developer: Zone tracking and warning throttle - cached for performance
         private Timer _zoneTimer;
         private Timer _doorTimer;
+        private Timer _powerlessDeviceTimer;
         private readonly HashSet<ulong> _respawnCommandFlag = new HashSet<ulong>();
         private readonly HashSet<ulong> _inZoneTracker = new HashSet<ulong>();
         private readonly Dictionary<ulong, float> _lastWeaponWarn = new Dictionary<ulong, float>();
@@ -99,6 +104,7 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, float> _lastBuildWarn = new Dictionary<ulong, float>();
         private readonly Dictionary<ulong, float> _lastDamageWarn = new Dictionary<ulong, float>();
         private readonly Dictionary<ulong, float> _lastDoorPulse = new Dictionary<ulong, float>();
+        private readonly HashSet<NetworkableId> _powerlessDevices = new HashSet<NetworkableId>();
 
         #endregion
 
@@ -137,7 +143,7 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <num> - Set safe zone radius (admin)",
                 ["HelpRespawn"] = "/respawn - Respawn yourself (lose items)",
                 ["HelpStatus"] = "/ws status - Show plugin status",
-                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s, Restore Logout Position: {3}, Door Assist: {4}, Chat Notices: {5}",
+                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s, Respawn cmd only: {3}, Decay prevention: {4}, Powerless devices: {5}",
             }, this, "en");
 
             // Russian
@@ -171,7 +177,7 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <число> - Установить радиус зоны (админ)",
                 ["HelpRespawn"] = "/respawn - Переродиться (потеря вещей)",
                 ["HelpStatus"] = "/ws status - Показать статус плагина",
-                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с, Возврат на выход: {3}, Авто-движение дверей: {4}, Чат-уведомления: {5}",
+                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с, Спавн по команде: {3}, Защита от гниения: {4}, Устройства без питания: {5}",
             }, this, "ru");
         }
 
@@ -216,6 +222,8 @@ namespace Oxide.Plugins
 
                 StartZoneEffectsTimer();
                 StartDoorMonitorTimer();
+                if (_config.Settings.PowerlessDevicesEnabled)
+                    StartPowerlessDeviceTimer();
                 CloseAllDoorsInZone();
                 PrintBanner();
             }
@@ -233,12 +241,15 @@ namespace Oxide.Plugins
                 SavePlayerData();
                 _doorTimer?.Destroy();
                 _zoneTimer?.Destroy();
+                _powerlessDeviceTimer?.Destroy();
+                
                 _inZoneTracker.Clear();
                 _lastWeaponWarn.Clear();
                 _lastLootWarn.Clear();
                 _lastBuildWarn.Clear();
                 _lastDamageWarn.Clear();
                 _lastDoorPulse.Clear();
+                _powerlessDevices.Clear();
 
                 // Developer: Clean up SafeZone flag to prevent stuck state on unload
                 foreach (var player in BasePlayer.activePlayerList)
@@ -612,9 +623,9 @@ namespace Oxide.Plugins
                 _config.Settings.Enabled,
                 _config.Settings.Radius,
                 _config.Settings.SpawnTimer,
-                _config.Settings.RestoreLogoutPositionOnReconnect,
-                _config.Settings.AutoOpenDoorsInZone,
-                _config.Settings.ChatNotificationsEnabled
+                _config.Settings.RespawnOnlyByCommand,
+                _config.Settings.PreventBuildingDecay,
+                _config.Settings.PowerlessDevicesEnabled
             );
             SendMessage(player, status);
         }
@@ -763,7 +774,7 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Handle respawn event for new players
+        // Developer: Handle respawn event - only force spawn on /respawn command, not on natural death
         private void OnPlayerRespawn(BasePlayer player)
         {
             if (player == null || !_config.Settings.Enabled)
@@ -771,10 +782,11 @@ namespace Oxide.Plugins
 
             try
             {
+                // Developer: Check if respawn was triggered by /respawn command
                 if (_respawnCommandFlag.Contains(player.userID))
                 {
                     _respawnCommandFlag.Remove(player.userID);
-                    if (_spawnData.IsSet)
+                    if (_spawnData.IsSet && _config.Settings.RespawnCommandEnabled)
                     {
                         timer.Once(RespawnDelay, () =>
                         {
@@ -788,6 +800,12 @@ namespace Oxide.Plugins
                     return;
                 }
 
+                // Developer: If RespawnOnlyByCommand is enabled, don't auto-respawn on natural death
+                // This allows players to use their sleeping bags naturally
+                if (_config.Settings.RespawnOnlyByCommand)
+                    return;
+
+                // Developer: Legacy behavior - only for players without bypass
                 if (HasBypassSpawn(player) || HasAdmin(player))
                     return;
 
@@ -871,7 +889,7 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Hard safe zone protection - no damage exceptions
+        // Developer: Hard safe zone protection - no damage exceptions. Also prevents building decay
         private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
             if (entity == null || info == null || !_config.Settings.Enabled)
@@ -882,13 +900,20 @@ namespace Oxide.Plugins
                 if (!IsInSpawnZone(entity.transform.position))
                     return null;
 
+                // Developer: Block damage to players
                 if (entity is BasePlayer victim)
                 {
                     float now = UnityEngine.Time.realtimeSinceStartup;
                     if (TryWarn(_lastDamageWarn, victim.userID, now, WarningCooldown))
                         SendZoneMessage(victim, Lang("DamageBlocked"));
+                    return false;
                 }
 
+                // Developer: Prevent building decay if option enabled
+                if (_config.Settings.PreventBuildingDecay && info?.Initiator == null && IsDecayDamage(info))
+                    return false;
+
+                // Developer: Block all other damage in safe zone
                 return false;
             }
             catch (Exception ex)
@@ -897,6 +922,13 @@ namespace Oxide.Plugins
             }
 
             return null;
+        }
+
+        // Developer: Check if damage is from entity decay (when initiator is null)
+        private bool IsDecayDamage(HitInfo info)
+        {
+            return info?.Initiator == null && info?.damageTypes != null && 
+                   info.damageTypes.Get(Rust.DamageType.Decay) > 0;
         }
 
         // Developer: Block looting of protected players
@@ -1336,13 +1368,89 @@ namespace Oxide.Plugins
         }
 
         // Developer: Print initialization banner with plugin status
+        // Developer: Periodic powerless device power-up system - allows certain devices to work without external power
+        private void StartPowerlessDeviceTimer()
+        {
+            if (_powerlessDeviceTimer != null) 
+                return;
+
+            _powerlessDeviceTimer = timer.Every(1f, () =>
+            {
+                try
+                {
+                    if (!_config.Settings.Enabled || !_config.Settings.PowerlessDevicesEnabled || !_spawnData.IsSet)
+                        return;
+
+                    Collider[] colliders = Physics.OverlapSphere(_spawnData.Position, _config.Settings.Radius, ~0, QueryTriggerInteraction.Collide);
+                    if (colliders?.Length == 0)
+                        return;
+
+                    var processedDevices = new HashSet<NetworkableId>();
+
+                    foreach (Collider collider in colliders)
+                    {
+                        if (collider == null)
+                            continue;
+
+                        BaseEntity entity = collider.GetComponentInParent<BaseEntity>();
+                        if (entity == null || entity.IsDestroyed || processedDevices.Contains(entity.net.ID))
+                            continue;
+
+                        processedDevices.Add(entity.net.ID);
+
+                        string shortName = entity.ShortPrefabName?.ToLowerInvariant();
+
+                        // Power up devices without requiring external power
+                        if (shortName == "electric.heater" || shortName == "electricheater")
+                        {
+                            entity.SetFlag(BaseEntity.Flags.On, true);
+                            entity.SendNetworkUpdate();
+                            _powerlessDevices.Add(entity.net.ID);
+                            continue;
+                        }
+
+                        if (shortName == "autoturret" && entity is AutoTurret turret && !turret.IsOnline())
+                        {
+                            turret.SetFlag(BaseEntity.Flags.On, true);
+                            turret.SendNetworkUpdate();
+                            _powerlessDevices.Add(entity.net.ID);
+                            continue;
+                        }
+
+                        if (shortName == "searchlight")
+                        {
+                            entity.SetFlag(BaseEntity.Flags.On, true);
+                            entity.SendNetworkUpdate();
+                            _powerlessDevices.Add(entity.net.ID);
+                        }
+                    }
+
+                    // Cleanup devices no longer in zone
+                    var devicesToRemove = new HashSet<NetworkableId>();
+                    foreach (NetworkableId deviceId in _powerlessDevices)
+                    {
+                        BaseEntity entity = BaseNetworkable.serverEntities.Find(deviceId) as BaseEntity;
+                        if (entity == null || entity.IsDestroyed || !IsInSpawnZone(entity.transform.position))
+                            devicesToRemove.Add(deviceId);
+                    }
+
+                    foreach (NetworkableId deviceId in devicesToRemove)
+                        _powerlessDevices.Remove(deviceId);
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Powerless device timer error: {ex}");
+                }
+            });
+        }
+
         private void PrintBanner()
         {
             Puts("==================================================");
             Puts($"{Name} loaded successfully.");
             Puts($"Version: {PluginVersion}");
             Puts($"Spawn set: {_spawnData.IsSet}, Radius: {_config.Settings.Radius}, Timer: {_config.Settings.SpawnTimer}s");
-            Puts($"Reconnect restore: {_config.Settings.RestoreLogoutPositionOnReconnect}, Door assist: {_config.Settings.AutoOpenDoorsInZone}, Chat notices: {_config.Settings.ChatNotificationsEnabled}");
+            Puts($"Decay prevention: {_config.Settings.PreventBuildingDecay}, Powerless devices: {_config.Settings.PowerlessDevicesEnabled}, Respawn by command only: {_config.Settings.RespawnOnlyByCommand}");
             Puts("==================================================");
         }
 
