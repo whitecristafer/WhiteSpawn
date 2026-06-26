@@ -1,21 +1,23 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
+using System.Reflection;
 using Oxide.Core;
 using Oxide.Core.Plugins;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.6.2")]
+    [Info("WhiteSpawn", "whitecristafer", "1.6.3")]
     [Description("WhiteSpawn - Advanced safe zone system with decay prevention and powerless devices support")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869;
-        private const string PluginVersion = "1.6.2";
+        private const string PluginVersion = "1.6.3";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
         private const string AdminPermission = "whitespawn.admin";
         private const string BypassTimerPermission = "whitespawn.bypasstimer";
@@ -124,6 +126,15 @@ namespace Oxide.Plugins
                 ["SpawnSet"] = "Spawn point set at your position.",
                 ["SpawnRadiusSet"] = "Spawn radius set to {0}.",
                 ["SpawnRadiusInvalid"] = "Invalid radius. Usage: /ws radius <number>",
+                ["PlayerNotFound"] = "Player not found.",
+                ["ReloadSuccess"] = "WhiteSpawn reloaded.",
+                ["ReloadFailed"] = "Reload failed. See server logs.",
+                ["SetUsage"] = "Usage: /ws set <option> <value>",
+                ["GetUsage"] = "Usage: /ws get <option>",
+                ["SetSuccess"] = "Set {0} = {1}",
+                ["SetFailed"] = "Failed to set {0}: {1}",
+                ["SetSpawnError"] = "An error occurred while setting spawn",
+                ["TeleportedPlayer"] = "Teleported {0} to spawn.",
                 ["WelcomeMessage"] = "Welcome to the server! You have been teleported to the safe spawn zone.",
                 ["RespawnMessage"] = "You have been respawned to the safe spawn zone.",
                 ["RespawnCommandUsed"] = "You have been respawned (items lost).",
@@ -139,6 +150,11 @@ namespace Oxide.Plugins
                 ["InvalidCommand"] = "Unknown command. Use /spawn or /ws help.",
                 ["HelpHeader"] = "WhiteSpawn Commands:",
                 ["HelpSpawn"] = "/spawn - Teleport to spawn",
+                ["HelpSpawnAdmin"] = "/spawn <steamid|nickname> - Teleport target to spawn (admin)",
+                ["HelpSet"] = "/ws set <option> <value> - Set config option (admin)",
+                ["HelpGet"] = "/ws get <option> - Get config option (admin)",
+                ["HelpReload"] = "/ws reload - Reload plugin (admin)",
+                ["HelpPowerless"] = "/ws set powerlessdevices <true|false> - Enable/disable powerless devices",
                 ["HelpSetSpawn"] = "/setspawn - Set spawn point (admin)",
                 ["HelpRadius"] = "/ws radius <num> - Set safe zone radius (admin)",
                 ["HelpRespawn"] = "/respawn - Respawn yourself (lose items)",
@@ -158,6 +174,15 @@ namespace Oxide.Plugins
                 ["SpawnSet"] = "Точка спавна установлена на вашей позиции.",
                 ["SpawnRadiusSet"] = "Радиус спавна установлен на {0}.",
                 ["SpawnRadiusInvalid"] = "Неверный радиус. Использование: /ws radius <число>",
+                ["PlayerNotFound"] = "Игрок не найден.",
+                ["ReloadSuccess"] = "WhiteSpawn перезагружен.",
+                ["ReloadFailed"] = "Перезагрузка не удалась. Смотрите логи сервера.",
+                ["SetUsage"] = "Использование: /ws set <опция> <значение>",
+                ["GetUsage"] = "Использование: /ws get <опция>",
+                ["SetSuccess"] = "Установлено {0} = {1}",
+                ["SetFailed"] = "Не удалось установить {0}: {1}",
+                ["SetSpawnError"] = "Произошла ошибка при установке точки спавна",
+                ["TeleportedPlayer"] = "Игрок {0} телепортирован на спавн.",
                 ["WelcomeMessage"] = "Добро пожаловать на сервер! Вы телепортированы в безопасную зону спавна.",
                 ["RespawnMessage"] = "Вы были респавнены в безопасную зону спавна.",
                 ["RespawnCommandUsed"] = "Вы переродились (вещи потеряны).",
@@ -173,6 +198,11 @@ namespace Oxide.Plugins
                 ["InvalidCommand"] = "Неизвестная команда. Используйте /spawn или /ws help.",
                 ["HelpHeader"] = "Команды WhiteSpawn:",
                 ["HelpSpawn"] = "/spawn - Телепорт на спавн",
+                ["HelpSpawnAdmin"] = "/spawn <steamid|никнейм> - Телепортировать игрока на спавн (админ)",
+                ["HelpSet"] = "/ws set <опция> <значение> - Установить параметр конфига (админ)",
+                ["HelpGet"] = "/ws get <опция> - Получить параметр конфига (админ)",
+                ["HelpReload"] = "/ws reload - Перезагрузить плагин (админ)",
+                ["HelpPowerless"] = "/ws set powerlessdevices <true|false> - Включить/выключить устройства без питания",
                 ["HelpSetSpawn"] = "/setspawn - Установить точку спавна (админ)",
                 ["HelpRadius"] = "/ws radius <число> - Установить радиус зоны (админ)",
                 ["HelpRespawn"] = "/respawn - Переродиться (потеря вещей)",
@@ -243,6 +273,22 @@ namespace Oxide.Plugins
                 _zoneTimer?.Destroy();
                 _powerlessDeviceTimer?.Destroy();
                 
+                foreach (NetworkableId id in _powerlessDevices)
+                {
+                    IOEntity ioEntity = BaseNetworkable.serverEntities.Find(id) as IOEntity;
+                    if (ioEntity != null && !ioEntity.IsDestroyed)
+                    {
+                        ioEntity.UpdateFromInput(0, 0);
+                        ioEntity.currentEnergy = 0;
+                        ioEntity.SetFlag(BaseEntity.Flags.On, false);
+                        if (ioEntity is AutoTurret turret && turret.IsOnline())
+                        {
+                            turret.Shutdown();
+                        }
+                        ioEntity.SendNetworkUpdate();
+                    }
+                }
+
                 _inZoneTracker.Clear();
                 _lastWeaponWarn.Clear();
                 _lastLootWarn.Clear();
@@ -441,12 +487,62 @@ namespace Oxide.Plugins
             cmd.AddChatCommand("spawn", this, nameof(CmdSpawn));
             cmd.AddChatCommand("setspawn", this, nameof(CmdSetSpawn));
             cmd.AddChatCommand("ws", this, nameof(CmdWS));
+            cmd.AddChatCommand("wsreload", this, nameof(CmdReload));
             cmd.AddChatCommand("respawn", this, nameof(CmdRespawn));
+        }
+
+        private void CmdReload(BasePlayer player, string command, string[] args)
+        {
+            if (!HasAdmin(player))
+            {
+                SendMessage(player, Lang("NoPermission"));
+                return;
+            }
+
+            try
+            {
+                Unload();
+                Init();
+                Loaded();
+                SendMessage(player, Lang("ReloadSuccess"));
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Reload error: {ex}");
+                SendMessage(player, Lang("ReloadFailed"));
+            }
         }
 
         private void CmdSpawn(BasePlayer player, string command, string[] args)
         {
-            if (player == null || !_config.Settings.Enabled)
+            if (player == null)
+            {
+                return;
+            }
+
+            // Admin teleport to other player: /spawn <id|name>
+            if (args.Length > 0 && HasAdmin(player))
+            {
+                string targetId = args[0];
+                BasePlayer target = FindPlayerByIdentifier(targetId);
+                if (target == null)
+                {
+                    SendMessage(player, Lang("PlayerNotFound"));
+                    return;
+                }
+
+                if (!_spawnData.IsSet)
+                {
+                    SendMessage(player, Lang("SpawnNotFound"));
+                    return;
+                }
+
+                DoTeleportToSpawn(target);
+                SendMessage(player, string.Format(Lang("TeleportedPlayer"), target.displayName));
+                return;
+            }
+
+            if (!_config.Settings.Enabled)
             {
                 SendMessage(player, Lang("PluginDisabled"));
                 return;
@@ -458,6 +554,7 @@ namespace Oxide.Plugins
                 return;
             }
 
+            // Allow sleeping bag respawns and restrict plugin teleportation on natural respawn
             if (player.IsHostile())
             {
                 SendMessage(player, Lang("CannotSpawnHostile"));
@@ -555,7 +652,7 @@ namespace Oxide.Plugins
             catch (Exception ex)
             {
                 PrintError($"SetSpawn error: {ex}");
-                SendMessage(player, "An error occurred while setting spawn");
+                SendMessage(player, Lang("SetSpawnError"));
             }
         }
 
@@ -584,6 +681,18 @@ namespace Oxide.Plugins
                         ShowStatus(player);
                         break;
 
+                    case "set":
+                        HandleSetCommand(player, args);
+                        break;
+
+                    case "get":
+                        HandleGetCommand(player, args);
+                        break;
+
+                    case "reload":
+                        CmdReload(player, "wsreload", null);
+                        break;
+
                     default:
                         SendMessage(player, Lang("InvalidCommand"));
                         break;
@@ -592,7 +701,7 @@ namespace Oxide.Plugins
             catch (Exception ex)
             {
                 PrintError($"WS command error: {ex}");
-                SendMessage(player, "An error occurred processing the command");
+                SendMessage(player, Lang("InvalidCommand"));
             }
         }
 
@@ -614,6 +723,114 @@ namespace Oxide.Plugins
             SaveConfig();
             SendMessage(player, string.Format(Lang("SpawnRadiusSet"), _config.Settings.Radius));
             Puts($"{player.displayName} set spawn radius to {_config.Settings.Radius}");
+        }
+
+        private void HandleSetCommand(BasePlayer player, string[] args)
+        {
+            if (!HasAdmin(player))
+            {
+                SendMessage(player, Lang("NoPermission"));
+                return;
+            }
+
+            if (args.Length < 3)
+            {
+                SendMessage(player, Lang("SetUsage"));
+                return;
+            }
+
+            string option = args[1].ToLowerInvariant();
+            string value = args[2];
+            if (TrySetConfigOption(option, value, out string err))
+            {
+                SaveConfig();
+                SendMessage(player, string.Format(Lang("SetSuccess"), option, value));
+            }
+            else
+            {
+                SendMessage(player, string.Format(Lang("SetFailed"), option, err));
+            }
+        }
+
+        private void HandleGetCommand(BasePlayer player, string[] args)
+        {
+            if (!HasAdmin(player))
+            {
+                SendMessage(player, Lang("NoPermission"));
+                return;
+            }
+
+            if (args.Length < 2)
+            {
+                SendMessage(player, Lang("GetUsage"));
+                return;
+            }
+
+            string option = args[1].ToLowerInvariant();
+            string val = GetConfigOption(option);
+            SendMessage(player, $"{option} = {val}");
+        }
+
+        private bool TrySetConfigOption(string option, string value, out string error)
+        {
+            error = null;
+            try
+            {
+                switch (option)
+                {
+                    case "enabled":
+                        _config.Settings.Enabled = bool.Parse(value);
+                        return true;
+                    case "spawntimer":
+                        _config.Settings.SpawnTimer = float.Parse(value);
+                        return true;
+                    case "radius":
+                        _config.Settings.Radius = float.Parse(value);
+                        return true;
+                    case "respawnonlybycommand":
+                        _config.Settings.RespawnOnlyByCommand = bool.Parse(value);
+                        return true;
+                    case "preventbuildingdecay":
+                        _config.Settings.PreventBuildingDecay = bool.Parse(value);
+                        return true;
+                    case "powerlessdevices":
+                        _config.Settings.PowerlessDevicesEnabled = bool.Parse(value);
+                        if (_config.Settings.PowerlessDevicesEnabled)
+                            StartPowerlessDeviceTimer();
+                        else
+                            _powerlessDeviceTimer?.Destroy();
+                        return true;
+                    default:
+                        error = "Unknown option";
+                        return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        private string GetConfigOption(string option)
+        {
+            switch (option)
+            {
+                case "enabled":
+                    return _config.Settings.Enabled.ToString();
+                case "spawntimer":
+                    return _config.Settings.SpawnTimer.ToString();
+                case "radius":
+                    return _config.Settings.Radius.ToString();
+                case "respawnonlybycommand":
+                    return _config.Settings.RespawnOnlyByCommand.ToString();
+                case "preventbuildingdecay":
+                    return _config.Settings.PreventBuildingDecay.ToString();
+                case "powerlessdevices":
+                    return _config.Settings.PowerlessDevicesEnabled.ToString();
+                default:
+                    return "Unknown option";
+            }
         }
 
         private void ShowStatus(BasePlayer player)
@@ -1008,6 +1225,9 @@ namespace Oxide.Plugins
                     {
                         _inZoneTracker.Add(player.userID);
                         SendZoneMessage(player, Lang("EnteredSafeZone"));
+                        // Enable powerless devices for this player if configured
+                        if (_config.Settings.PowerlessDevicesEnabled)
+                            TryEnableNearbyDevices(player);
                     }
 
                     if (!player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
@@ -1030,6 +1250,9 @@ namespace Oxide.Plugins
                         player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
 
                     SendZoneMessage(player, Lang("LeaveSafeZone"));
+                    // Disable devices when player leaves
+                    if (_config.Settings.PowerlessDevicesEnabled)
+                        DisableDevicesNearby(player);
                 }
                 else if (player.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone))
                 {
@@ -1112,7 +1335,13 @@ namespace Oxide.Plugins
         {
             try
             {
-                Item active = player?.GetActiveItem();
+                if (player == null) return;
+
+                // Developers: Admins should be able to use weapons regardless of zone
+                if (HasAdmin(player))
+                    return;
+
+                Item active = player.GetActiveItem();
                 if (!IsRestrictedItem(active))
                     return;
 
@@ -1261,6 +1490,117 @@ namespace Oxide.Plugins
             }
         }
 
+        // Developer: Enable nearby devices for player convenience inside zone
+        private void TryEnableNearbyDevices(BasePlayer player)
+        {
+            if (player == null || !_config.Settings.PowerlessDevicesEnabled)
+                return;
+
+            try
+            {
+                Collider[] colliders = Physics.OverlapSphere(player.transform.position, _config.Settings.DoorOpenRadius * 2f, ~0, QueryTriggerInteraction.Collide);
+                if (colliders?.Length == 0) return;
+
+                foreach (Collider collider in colliders)
+                {
+                    if (collider == null) continue;
+
+                    BaseEntity entity = collider.GetComponentInParent<BaseEntity>();
+                    if (entity == null || entity.IsDestroyed) continue;
+
+                    NetworkableId id = entity.net?.ID ?? default(NetworkableId);
+                    if (id == default(NetworkableId) || _powerlessDevices.Contains(id)) continue;
+
+                    string shortName = entity.ShortPrefabName?.ToLowerInvariant();
+
+                    if (shortName == "electric.heater" || shortName == "electricheater" || shortName == "autoturret" || shortName == "searchlight")
+                    {
+                        IOEntity ioEntity = entity as IOEntity;
+                        if (ioEntity == null) continue;
+
+                        _powerlessDevices.Add(id);
+                        int powerNeeded = Mathf.Max(ioEntity.ConsumptionAmount(), 10);
+                        ioEntity.currentEnergy = powerNeeded;
+                        ioEntity.SetFlag(BaseEntity.Flags.On, true);
+                        if (ioEntity is AutoTurret turret && !turret.IsOnline())
+                        {
+                            turret.InitiateStartup();
+                        }
+                        ioEntity.SendNetworkUpdate();
+                        Puts($"Powered device {shortName} ({id}) at {entity.transform.position}");
+                        continue;
+                    }
+
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintError($"TryEnableNearbyDevices error: {ex}");
+            }
+        }
+
+        // Developer: Try invoking a named method by reflection as a fallback
+        private void TryInvokeMethod(object target, string methodName, params object[] args)
+        {
+            if (target == null || string.IsNullOrEmpty(methodName)) return;
+
+            try
+            {
+                MethodInfo mi = target.GetType().GetMethod(methodName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (mi != null)
+                {
+                    mi.Invoke(target, args);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Swallow errors silently but log for debugging
+                PrintError($"Reflection invoke {methodName} failed on {target.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // Developer: Disable devices previously enabled for this player/zone
+        private void DisableDevicesNearby(BasePlayer player)
+        {
+            if (!_config.Settings.PowerlessDevicesEnabled) return;
+
+            try
+            {
+                var toRemove = new List<NetworkableId>();
+
+                foreach (NetworkableId id in _powerlessDevices)
+                {
+                    IOEntity ioEntity = BaseNetworkable.serverEntities.Find(id) as IOEntity;
+                    if (ioEntity == null || ioEntity.IsDestroyed)
+                    {
+                        toRemove.Add(id);
+                        continue;
+                    }
+
+                    if (!IsInSpawnZone(ioEntity.transform.position))
+                    {
+                        ioEntity.UpdateFromInput(0, 0);
+                        ioEntity.currentEnergy = 0;
+                        ioEntity.SetFlag(BaseEntity.Flags.On, false);
+                        
+                        if (ioEntity is AutoTurret turret && turret.IsOnline())
+                        {
+                            turret.Shutdown();
+                        }
+                        
+                        ioEntity.SendNetworkUpdate();
+                        toRemove.Add(id);
+                    }
+                }
+
+                foreach (NetworkableId id in toRemove)
+                    _powerlessDevices.Remove(id);
+            }
+            catch (Exception ex)
+            {
+                PrintError($"DisableDevicesNearby error: {ex}");
+            }
+        }
         // Developer: Throttled warning for loot attempts
         private void WarnLootBlocked(BasePlayer player)
         {
@@ -1294,6 +1634,25 @@ namespace Oxide.Plugins
 
             storage[userId] = now;
             return true;
+        }
+
+        // Developer: Find player by steamid, userid or partial nickname
+        private BasePlayer FindPlayerByIdentifier(string ident)
+        {
+            if (string.IsNullOrEmpty(ident)) return null;
+            // Try SteamID
+            if (ulong.TryParse(ident, out ulong id))
+                return BasePlayer.FindByID(id);
+
+            // By partial name (first match)
+            var match = BasePlayer.activePlayerList
+                .Where(p => p != null && !string.IsNullOrEmpty(p.displayName) && p.displayName.IndexOf(ident, StringComparison.OrdinalIgnoreCase) >= 0)
+                .FirstOrDefault();
+
+            if (match != null) return match;
+
+            // By UserIDString exact
+            return BasePlayer.activePlayerList.FirstOrDefault(p => p != null && p.UserIDString == ident);
         }
 
         // Developer: Auto-locate spawn at Outpost or Bandit if not manually set
@@ -1401,37 +1760,54 @@ namespace Oxide.Plugins
                         string shortName = entity.ShortPrefabName?.ToLowerInvariant();
 
                         // Power up devices without requiring external power
-                        if (shortName == "electric.heater" || shortName == "electricheater")
+                        if (shortName == "electric.heater" || shortName == "electricheater" || shortName == "autoturret" || shortName == "searchlight")
                         {
-                            entity.SetFlag(BaseEntity.Flags.On, true);
-                            entity.SendNetworkUpdate();
-                            _powerlessDevices.Add(entity.net.ID);
-                            continue;
-                        }
+                            IOEntity ioEntity = entity as IOEntity;
+                            if (ioEntity == null) continue;
 
-                        if (shortName == "autoturret" && entity is AutoTurret turret && !turret.IsOnline())
-                        {
-                            turret.SetFlag(BaseEntity.Flags.On, true);
-                            turret.SendNetworkUpdate();
-                            _powerlessDevices.Add(entity.net.ID);
-                            continue;
-                        }
+                            NetworkableId id = ioEntity.net.ID;
+                            if (!_powerlessDevices.Contains(id))
+                            {
+                                _powerlessDevices.Add(id);
+                            }
 
-                        if (shortName == "searchlight")
-                        {
-                            entity.SetFlag(BaseEntity.Flags.On, true);
-                            entity.SendNetworkUpdate();
-                            _powerlessDevices.Add(entity.net.ID);
+                            int powerNeeded = Mathf.Max(ioEntity.ConsumptionAmount(), 10);
+                            
+                            // If the device has lost power or it has turned off, turn on the power again.
+                            if (ioEntity.currentEnergy < powerNeeded || !ioEntity.HasFlag(BaseEntity.Flags.On))
+                            {
+                                ioEntity.currentEnergy = powerNeeded;
+                                ioEntity.SetFlag(BaseEntity.Flags.On, true);
+                                
+                                if (ioEntity is AutoTurret turret && !turret.IsOnline())
+                                {
+                                    turret.InitiateStartup();
+                                }
+                                ioEntity.SendNetworkUpdate();
+                            }
                         }
                     }
 
-                    // Cleanup devices no longer in zone
+                    // Turning off devices that have been removed from the spawn zone
                     var devicesToRemove = new HashSet<NetworkableId>();
                     foreach (NetworkableId deviceId in _powerlessDevices)
                     {
                         BaseEntity entity = BaseNetworkable.serverEntities.Find(deviceId) as BaseEntity;
                         if (entity == null || entity.IsDestroyed || !IsInSpawnZone(entity.transform.position))
+                        {
                             devicesToRemove.Add(deviceId);
+                            if (entity is IOEntity ioEntity)
+                            {
+                                ioEntity.currentEnergy = 0;
+                                ioEntity.SetFlag(BaseEntity.Flags.On, false);
+                                
+                                if (ioEntity is AutoTurret turret && turret.IsOnline())
+                                {
+                                    turret.Shutdown();
+                                }
+                                ioEntity.SendNetworkUpdate();
+                            }
+                        }
                     }
 
                     foreach (NetworkableId deviceId in devicesToRemove)
