@@ -159,6 +159,30 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <num> - Set safe zone radius (admin)",
                 ["HelpRespawn"] = "/respawn - Respawn yourself (lose items)",
                 ["HelpStatus"] = "/ws status - Show plugin status",
+                ["ConfigHeader"] = "<size=16><color=#66ccff><b>WhiteSpawn Configuration</b></color></size>",
+                ["ConfigLine"] = "{0}: {1}",
+                ["ConfigEnabled"] = "Plugin Enabled",
+                ["ConfigSpawnTimer"] = "Spawn Timer (sec)",
+                ["ConfigRadius"] = "Safe Zone Radius",
+                ["ConfigWelcome"] = "Welcome Message",
+                ["ConfigRespawnMsg"] = "Respawn Message",
+                ["ConfigRespawnCmd"] = "Respawn Command",
+                ["ConfigFindOutpost"] = "Find Outpost First",
+                ["ConfigBlockWeapons"] = "Block Weapons/Tools",
+                ["ConfigFreezeMeta"] = "Freeze Metabolism",
+                ["ConfigChatNotif"] = "Chat Notifications",
+                ["ConfigBlockLoot"] = "Block Looting",
+                ["ConfigBlockBuild"] = "Block Building",
+                ["ConfigAutoOpenDoors"] = "Auto Open Doors",
+                ["ConfigDoorRadius"] = "Door Open Radius",
+                ["ConfigDoorInterval"] = "Door Open Interval",
+                ["ConfigDoorCloseDelay"] = "Door Close Delay",
+                ["ConfigRestoreLogout"] = "Restore Logout Position",
+                ["ConfigRespawnOnlyCmd"] = "Respawn Only by Command",
+                ["ConfigPreventDecay"] = "Prevent Building Decay",
+                ["ConfigPowerlessDevices"] = "Powerless Devices",
+                ["ConfigHelp"] = "Use /ws set <option> <value> to change settings.",
+                ["ConfigOptionNotFound"] = "Option not found. Use /ws config to see all options.",
                 ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s, Respawn cmd only: {3}, Decay prevention: {4}, Powerless devices: {5}",
             }, this, "en");
 
@@ -207,6 +231,30 @@ namespace Oxide.Plugins
                 ["HelpRadius"] = "/ws radius <число> - Установить радиус зоны (админ)",
                 ["HelpRespawn"] = "/respawn - Переродиться (потеря вещей)",
                 ["HelpStatus"] = "/ws status - Показать статус плагина",
+                ["ConfigHeader"] = "<size=16><color=#66ccff><b>Конфигурация WhiteSpawn</b></color></size>",
+                ["ConfigLine"] = "{0}: {1}",
+                ["ConfigEnabled"] = "Плагин включён",
+                ["ConfigSpawnTimer"] = "Таймер спавна (сек)",
+                ["ConfigRadius"] = "Радиус зоны",
+                ["ConfigWelcome"] = "Приветственное сообщение",
+                ["ConfigRespawnMsg"] = "Сообщение о респавне",
+                ["ConfigRespawnCmd"] = "Команда респавна",
+                ["ConfigFindOutpost"] = "Искать аванпост сначала",
+                ["ConfigBlockWeapons"] = "Блокировать оружие/инструменты",
+                ["ConfigFreezeMeta"] = "Замораживать метаболизм",
+                ["ConfigChatNotif"] = "Уведомления в чат",
+                ["ConfigBlockLoot"] = "Блокировать лутание",
+                ["ConfigBlockBuild"] = "Блокировать строительство",
+                ["ConfigAutoOpenDoors"] = "Автооткрытие дверей",
+                ["ConfigDoorRadius"] = "Радиус открытия дверей",
+                ["ConfigDoorInterval"] = "Интервал открытия дверей",
+                ["ConfigDoorCloseDelay"] = "Задержка закрытия дверей",
+                ["ConfigRestoreLogout"] = "Восстанавливать позицию выхода",
+                ["ConfigRespawnOnlyCmd"] = "Респавн только по команде",
+                ["ConfigPreventDecay"] = "Защита от гниения построек",
+                ["ConfigPowerlessDevices"] = "Устройства без питания",
+                ["ConfigHelp"] = "Используйте /ws set <опция> <значение> для изменения.",
+                ["ConfigOptionNotFound"] = "Опция не найдена. Используйте /ws config для просмотра всех опций.",
                 ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с, Спавн по команде: {3}, Защита от гниения: {4}, Устройства без питания: {5}",
             }, this, "ru");
         }
@@ -666,35 +714,32 @@ namespace Oxide.Plugins
 
             try
             {
-                string sub = args[0].ToLowerInvariant();
-                switch (sub)
+                if (args.Length == 0 || args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
                 {
-                    case "help":
-                        ShowHelp(player);
-                        break;
+                    ShowHelp(player);
+                    return;
+                }
 
-                    case "radius":
-                        HandleRadiusCommand(player, args);
-                        break;
-
+                switch (args[0].ToLower())
+                {
+                    case "config":
+                        ShowConfig(player);
+                        return;
                     case "status":
                         ShowStatus(player);
-                        break;
-
+                        return;
                     case "set":
-                        HandleSetCommand(player, args);
-                        break;
-
+                        HandleSet(player, args);
+                        return;
                     case "get":
-                        HandleGetCommand(player, args);
-                        break;
-
+                        HandleGet(player, args);
+                        return;
                     case "reload":
-                        CmdReload(player, "wsreload", null);
-                        break;
-
+                        if (!player.IsAdmin) { SendReply(player, lang.GetMessage("NoPermission", this, player.UserIDString)); return; }
+                        ReloadPlugin(player);
+                        return;
                     default:
-                        SendMessage(player, Lang("InvalidCommand"));
+                        SendReply(player, lang.GetMessage("InvalidCommand", this, player.UserIDString));
                         break;
                 }
             }
@@ -835,27 +880,70 @@ namespace Oxide.Plugins
 
         private void ShowStatus(BasePlayer player)
         {
-            string status = string.Format(
-                Lang("Status"),
-                _config.Settings.Enabled,
-                _config.Settings.Radius,
-                _config.Settings.SpawnTimer,
-                _config.Settings.RespawnOnlyByCommand,
-                _config.Settings.PreventBuildingDecay,
-                _config.Settings.PowerlessDevicesEnabled
-            );
-            SendMessage(player, status);
+            var cfg = _config.Settings;
+            string status = string.Format(lang.GetMessage("Status", this, player.UserIDString),
+                cfg.Enabled ? "<color=#00ff00>Yes</color>" : "<color=#ff0000>No</color>",
+                cfg.Radius,
+                cfg.SpawnTimer,
+                cfg.RespawnOnlyByCommand ? "Yes" : "No",
+                cfg.PreventBuildingDecay ? "Yes" : "No",
+                cfg.PowerlessDevicesEnabled ? "Yes" : "No");
+            SendReply(player, status);
+        }
+
+        private void ShowConfig(BasePlayer player)
+        {
+            var cfg = _config.Settings;
+            var messages = lang.GetMessages(player.UserIDString);
+            SendReply(player, messages["ConfigHeader"]);
+
+            var lines = new[]
+            {
+                ("ConfigEnabled", cfg.Enabled),
+                ("ConfigSpawnTimer", cfg.SpawnTimer),
+                ("ConfigRadius", cfg.Radius),
+                ("ConfigWelcome", cfg.WelcomeMessageEnabled),
+                ("ConfigRespawnMsg", cfg.RespawnMessageEnabled),
+                ("ConfigRespawnCmd", cfg.RespawnCommandEnabled),
+                ("ConfigFindOutpost", cfg.FindOutpostFirst),
+                ("ConfigBlockWeapons", cfg.BlockWeaponsAndTools),
+                ("ConfigFreezeMeta", cfg.FreezeMetabolismInZone),
+                ("ConfigChatNotif", cfg.ChatNotificationsEnabled),
+                ("ConfigBlockLoot", cfg.BlockLootingInZone),
+                ("ConfigBlockBuild", cfg.BlockBuildingInZone),
+                ("ConfigAutoOpenDoors", cfg.AutoOpenDoorsInZone),
+                ("ConfigDoorRadius", cfg.DoorOpenRadius),
+                ("ConfigDoorInterval", cfg.DoorOpenInterval),
+                ("ConfigDoorCloseDelay", cfg.DoorCloseDelay),
+                ("ConfigRestoreLogout", cfg.RestoreLogoutPositionOnReconnect),
+                ("ConfigRespawnOnlyCmd", cfg.RespawnOnlyByCommand),
+                ("ConfigPreventDecay", cfg.PreventBuildingDecay),
+                ("ConfigPowerlessDevices", cfg.PowerlessDevicesEnabled),
+            };
+
+            foreach (var (key, value) in lines)
+            {
+                string label = messages[key];
+                string valStr = value is bool ? (bool)value ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>" : value.ToString();
+                SendReply(player, string.Format(messages["ConfigLine"], label, valStr));
+            }
+            SendReply(player, messages["ConfigHelp"]);
         }
 
         private void ShowHelp(BasePlayer player)
         {
-            SendMessage(player, Lang("HelpHeader"));
-            SendMessage(player, Lang("HelpSpawn"));
-            SendMessage(player, Lang("HelpSetSpawn"));
-            SendMessage(player, Lang("HelpRadius"));
-            if (_config.Settings.RespawnCommandEnabled)
-                SendMessage(player, Lang("HelpRespawn"));
-            SendMessage(player, Lang("HelpStatus"));
+            var messages = lang.GetMessages(player.UserIDString);
+            SendReply(player, messages["HelpHeader"]);
+            SendReply(player, messages["HelpSpawn"]);
+            SendReply(player, messages["HelpRespawn"]);
+            SendReply(player, messages["HelpStatus"]);
+            SendReply(player, messages["HelpSetSpawn"]);
+            SendReply(player, messages["HelpSet"]);
+            SendReply(player, messages["HelpGet"]);
+            SendReply(player, messages["HelpRadius"]);
+            SendReply(player, messages["HelpPowerless"]);
+            SendReply(player, messages["HelpReload"]);
+            SendReply(player, "<color=#ffcc00>/ws config</color> - Show all configuration options");
         }
 
         private void CmdRespawn(BasePlayer player, string command, string[] args)
