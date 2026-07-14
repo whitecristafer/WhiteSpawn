@@ -10,14 +10,14 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.6.3")]
+    [Info("WhiteSpawn", "whitecristafer", "1.6.4")]
     [Description("WhiteSpawn - Advanced safe zone system with decay prevention and powerless devices support")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869;
-        private const string PluginVersion = "1.6.3";
+        private const string PluginVersion = "1.6.4";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
         private const string AdminPermission = "whitespawn.admin";
         private const string BypassTimerPermission = "whitespawn.bypasstimer";
@@ -479,7 +479,12 @@ namespace Oxide.Plugins
         {
             try
             {
-                string json = JsonConvert.SerializeObject(_spawnData, Formatting.Indented);
+                var settings = new JsonSerializerSettings
+                {
+                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
+                    Formatting = Formatting.Indented
+                };
+                string json = JsonConvert.SerializeObject(_spawnData, settings);
                 File.WriteAllText(_spawnDataFile, json);
             }
             catch (Exception ex)
@@ -517,7 +522,12 @@ namespace Oxide.Plugins
         {
             try
             {
-                string json = JsonConvert.SerializeObject(_playerData, Formatting.Indented);
+                var settings = new JsonSerializerSettings
+                {
+                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
+                    Formatting = Formatting.Indented
+                };
+                string json = JsonConvert.SerializeObject(_playerData, settings);
                 File.WriteAllText(_playerDataFile, json);
             }
             catch (Exception ex)
@@ -639,7 +649,7 @@ namespace Oxide.Plugins
                 if (player.IsHostile())
                 {
                     player.State.unHostileTimestamp = 0;
-                    player.ClientRPCPlayer(null, player, "SetHostileLength", 0f);
+                    player.SendNetworkUpdate();
                 }
 
                 // Developer: Visual feedback for teleportation
@@ -706,6 +716,9 @@ namespace Oxide.Plugins
 
         private void CmdWS(BasePlayer player, string command, string[] args)
         {
+            if (player == null) return; 
+
+            //Puts($"CmdWS called by {player.displayName} with args: '{string.Join("', '", args)}' (count={args.Length})");
             if (args.Length == 0)
             {
                 ShowHelp(player);
@@ -714,7 +727,7 @@ namespace Oxide.Plugins
 
             try
             {
-                if (args.Length == 0 || args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
+                if (args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
                 {
                     ShowHelp(player);
                     return;
@@ -729,17 +742,27 @@ namespace Oxide.Plugins
                         ShowStatus(player);
                         return;
                     case "set":
-                        HandleSet(player, args);
+                        HandleSetCommand(player, args);  
                         return;
                     case "get":
-                        HandleGet(player, args);
+                        HandleGetCommand(player, args); 
+                        return;
+                    case "help":
+                        ShowHelp(player);
                         return;
                     case "reload":
-                        if (!player.IsAdmin) { SendReply(player, lang.GetMessage("NoPermission", this, player.UserIDString)); return; }
-                        ReloadPlugin(player);
+                        if (!HasAdmin(player))
+                        {
+                            SendMessage(player, Lang("NoPermission"));
+                            return;
+                        }
+                        CmdReload(player, command, args);
+                        return;
+                    case "radius":
+                        HandleRadiusCommand(player, args);
                         return;
                     default:
-                        SendReply(player, lang.GetMessage("InvalidCommand", this, player.UserIDString));
+                        SendMessage(player, Lang("InvalidCommand"));
                         break;
                 }
             }
@@ -881,69 +904,59 @@ namespace Oxide.Plugins
         private void ShowStatus(BasePlayer player)
         {
             var cfg = _config.Settings;
-            string status = string.Format(lang.GetMessage("Status", this, player.UserIDString),
+            string status = string.Format(Lang("Status"),
                 cfg.Enabled ? "<color=#00ff00>Yes</color>" : "<color=#ff0000>No</color>",
                 cfg.Radius,
                 cfg.SpawnTimer,
                 cfg.RespawnOnlyByCommand ? "Yes" : "No",
                 cfg.PreventBuildingDecay ? "Yes" : "No",
                 cfg.PowerlessDevicesEnabled ? "Yes" : "No");
-            SendReply(player, status);
+            SendMessage(player, status);
         }
 
         private void ShowConfig(BasePlayer player)
         {
             var cfg = _config.Settings;
-            var messages = lang.GetMessages(player.UserIDString);
-            SendReply(player, messages["ConfigHeader"]);
 
-            var lines = new[]
-            {
-                ("ConfigEnabled", cfg.Enabled),
-                ("ConfigSpawnTimer", cfg.SpawnTimer),
-                ("ConfigRadius", cfg.Radius),
-                ("ConfigWelcome", cfg.WelcomeMessageEnabled),
-                ("ConfigRespawnMsg", cfg.RespawnMessageEnabled),
-                ("ConfigRespawnCmd", cfg.RespawnCommandEnabled),
-                ("ConfigFindOutpost", cfg.FindOutpostFirst),
-                ("ConfigBlockWeapons", cfg.BlockWeaponsAndTools),
-                ("ConfigFreezeMeta", cfg.FreezeMetabolismInZone),
-                ("ConfigChatNotif", cfg.ChatNotificationsEnabled),
-                ("ConfigBlockLoot", cfg.BlockLootingInZone),
-                ("ConfigBlockBuild", cfg.BlockBuildingInZone),
-                ("ConfigAutoOpenDoors", cfg.AutoOpenDoorsInZone),
-                ("ConfigDoorRadius", cfg.DoorOpenRadius),
-                ("ConfigDoorInterval", cfg.DoorOpenInterval),
-                ("ConfigDoorCloseDelay", cfg.DoorCloseDelay),
-                ("ConfigRestoreLogout", cfg.RestoreLogoutPositionOnReconnect),
-                ("ConfigRespawnOnlyCmd", cfg.RespawnOnlyByCommand),
-                ("ConfigPreventDecay", cfg.PreventBuildingDecay),
-                ("ConfigPowerlessDevices", cfg.PowerlessDevicesEnabled),
-            };
-
-            foreach (var (key, value) in lines)
-            {
-                string label = messages[key];
-                string valStr = value is bool ? (bool)value ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>" : value.ToString();
-                SendReply(player, string.Format(messages["ConfigLine"], label, valStr));
-            }
-            SendReply(player, messages["ConfigHelp"]);
+            SendMessage(player, Lang("ConfigHeader"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigEnabled"), cfg.Enabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigSpawnTimer"), cfg.SpawnTimer));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRadius"), cfg.Radius));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigWelcome"), cfg.WelcomeMessageEnabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRespawnMsg"), cfg.RespawnMessageEnabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRespawnCmd"), cfg.RespawnCommandEnabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigFindOutpost"), cfg.FindOutpostFirst ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigBlockWeapons"), cfg.BlockWeaponsAndTools ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigFreezeMeta"), cfg.FreezeMetabolismInZone ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigChatNotif"), cfg.ChatNotificationsEnabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigBlockLoot"), cfg.BlockLootingInZone ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigBlockBuild"), cfg.BlockBuildingInZone ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigAutoOpenDoors"), cfg.AutoOpenDoorsInZone ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigDoorRadius"), cfg.DoorOpenRadius));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigDoorInterval"), cfg.DoorOpenInterval));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigDoorCloseDelay"), cfg.DoorCloseDelay));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRestoreLogout"), cfg.RestoreLogoutPositionOnReconnect ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRespawnOnlyCmd"), cfg.RespawnOnlyByCommand ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigPreventDecay"), cfg.PreventBuildingDecay ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigPowerlessDevices"), cfg.PowerlessDevicesEnabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, Lang("ConfigHelp"));
         }
 
         private void ShowHelp(BasePlayer player)
         {
-            var messages = lang.GetMessages(player.UserIDString);
-            SendReply(player, messages["HelpHeader"]);
-            SendReply(player, messages["HelpSpawn"]);
-            SendReply(player, messages["HelpRespawn"]);
-            SendReply(player, messages["HelpStatus"]);
-            SendReply(player, messages["HelpSetSpawn"]);
-            SendReply(player, messages["HelpSet"]);
-            SendReply(player, messages["HelpGet"]);
-            SendReply(player, messages["HelpRadius"]);
-            SendReply(player, messages["HelpPowerless"]);
-            SendReply(player, messages["HelpReload"]);
-            SendReply(player, "<color=#ffcc00>/ws config</color> - Show all configuration options");
+            if (player == null) return;
+
+            SendMessage(player, Lang("HelpHeader"));
+            SendMessage(player, Lang("HelpSpawn"));
+            SendMessage(player, Lang("HelpRespawn"));
+            SendMessage(player, Lang("HelpStatus"));
+            SendMessage(player, Lang("HelpSetSpawn"));
+            SendMessage(player, Lang("HelpSet"));
+            SendMessage(player, Lang("HelpGet"));
+            SendMessage(player, Lang("HelpRadius"));
+            SendMessage(player, Lang("HelpPowerless"));
+            SendMessage(player, Lang("HelpReload"));
+            SendMessage(player, "<color=#ffcc00>/ws config</color> - Show all configuration options");
         }
 
         private void CmdRespawn(BasePlayer player, string command, string[] args)
