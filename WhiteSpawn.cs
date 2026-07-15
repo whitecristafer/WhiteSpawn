@@ -10,14 +10,14 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("WhiteSpawn", "whitecristafer", "1.6.4")]
+    [Info("WhiteSpawn", "whitecristafer", "1.6.6")]
     [Description("WhiteSpawn - Advanced safe zone system with decay prevention and powerless devices support")]
     public class WhiteSpawn : RustPlugin
     {
         #region Constants
 
         private const ulong PluginIcon = 76561198209258869;
-        private const string PluginVersion = "1.6.4";
+        private const string PluginVersion = "1.6.6";
         private const string Prefix = "<size=12><color=#66ccff><b>WhiteSpawn</b></color></size> |";
         private const string AdminPermission = "whitespawn.admin";
         private const string BypassTimerPermission = "whitespawn.bypasstimer";
@@ -63,10 +63,14 @@ namespace Oxide.Plugins
             public float DoorOpenInterval { get; set; } = 0.75f;
             public float DoorCloseDelay { get; set; } = 3.0f;
             public bool RestoreLogoutPositionOnReconnect { get; set; } = false;
-            // Developer: Advanced features for respawn and building management
             public bool RespawnOnlyByCommand { get; set; } = true;
             public bool PreventBuildingDecay { get; set; } = true;
             public bool PowerlessDevicesEnabled { get; set; } = false;
+            
+            // NEW: Cooldown and corpse cleanup features
+            public float RespawnCooldown { get; set; } = 60f; // seconds between /respawn uses
+            public bool RemoveEmptyCorpses { get; set; } = true; // remove corpses after looting if empty/only standard items
+            public List<string> StandardItems { get; set; } = new List<string> { "rock", "torch" }; // items considered "standard"
         }
 
         #endregion
@@ -95,10 +99,10 @@ namespace Oxide.Plugins
             public Quaternion Rotation { get; set; }
         }
 
-        // Developer: Zone tracking and warning throttle - cached for performance
         private Timer _zoneTimer;
         private Timer _doorTimer;
         private Timer _powerlessDeviceTimer;
+        private Timer _corpseCleanupTimer; // NEW: periodic cleanup of corpses in zone
         private readonly HashSet<ulong> _respawnCommandFlag = new HashSet<ulong>();
         private readonly HashSet<ulong> _inZoneTracker = new HashSet<ulong>();
         private readonly Dictionary<ulong, float> _lastWeaponWarn = new Dictionary<ulong, float>();
@@ -107,6 +111,7 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, float> _lastDamageWarn = new Dictionary<ulong, float>();
         private readonly Dictionary<ulong, float> _lastDoorPulse = new Dictionary<ulong, float>();
         private readonly HashSet<NetworkableId> _powerlessDevices = new HashSet<NetworkableId>();
+        private readonly Dictionary<ulong, float> _lastRespawnTime = new Dictionary<ulong, float>();
 
         #endregion
 
@@ -181,9 +186,15 @@ namespace Oxide.Plugins
                 ["ConfigRespawnOnlyCmd"] = "Respawn Only by Command",
                 ["ConfigPreventDecay"] = "Prevent Building Decay",
                 ["ConfigPowerlessDevices"] = "Powerless Devices",
+                ["ConfigRespawnCooldown"] = "Respawn Cooldown (sec)",
+                ["ConfigRemoveEmptyCorpses"] = "Remove Empty Corpses",
+                ["ConfigStandardItems"] = "Standard Items",
                 ["ConfigHelp"] = "Use /ws set <option> <value> to change settings.",
                 ["ConfigOptionNotFound"] = "Option not found. Use /ws config to see all options.",
-                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s, Respawn cmd only: {3}, Decay prevention: {4}, Powerless devices: {5}",
+                ["Status"] = "WhiteSpawn: Enabled: {0}, Radius: {1}, Spawn Timer: {2}s, Respawn cmd only: {3}, Decay prevention: {4}, Powerless devices: {5}, Respawn cooldown: {6}s",
+                ["RespawnCooldown"] = "Please wait {0} seconds before using /respawn again.",
+                ["RespawnNotAllowedInZone"] = "You cannot use /respawn while inside the safe zone.",
+                ["EmptyCorpseRemoved"] = "An empty corpse has been removed to keep the spawn clean.",
             }, this, "en");
 
             // Russian
@@ -253,9 +264,15 @@ namespace Oxide.Plugins
                 ["ConfigRespawnOnlyCmd"] = "Респавн только по команде",
                 ["ConfigPreventDecay"] = "Защита от гниения построек",
                 ["ConfigPowerlessDevices"] = "Устройства без питания",
+                ["ConfigRespawnCooldown"] = "Кулдаун респавна (сек)",
+                ["ConfigRemoveEmptyCorpses"] = "Удалять пустые трупы",
+                ["ConfigStandardItems"] = "Стандартные предметы",
                 ["ConfigHelp"] = "Используйте /ws set <опция> <значение> для изменения.",
                 ["ConfigOptionNotFound"] = "Опция не найдена. Используйте /ws config для просмотра всех опций.",
-                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с, Спавн по команде: {3}, Защита от гниения: {4}, Устройства без питания: {5}",
+                ["Status"] = "WhiteSpawn: Включён: {0}, Радиус: {1}, Таймер: {2}с, Спавн по команде: {3}, Защита от гниения: {4}, Устройства без питания: {5}, Кулдаун респавна: {6}с",
+                ["RespawnCooldown"] = "Подождите {0} секунд перед использованием /respawn.",
+                ["RespawnNotAllowedInZone"] = "Вы не можете использовать /respawn внутри безопасной зоны.",
+                ["EmptyCorpseRemoved"] = "Пустой труп удалён для чистоты спавна.",
             }, this, "ru");
         }
 
@@ -302,6 +319,8 @@ namespace Oxide.Plugins
                 StartDoorMonitorTimer();
                 if (_config.Settings.PowerlessDevicesEnabled)
                     StartPowerlessDeviceTimer();
+                if (_config.Settings.RemoveEmptyCorpses)
+                    StartCorpseCleanupTimer(); // NEW: periodic corpse cleanup
                 CloseAllDoorsInZone();
                 PrintBanner();
             }
@@ -320,6 +339,7 @@ namespace Oxide.Plugins
                 _doorTimer?.Destroy();
                 _zoneTimer?.Destroy();
                 _powerlessDeviceTimer?.Destroy();
+                _corpseCleanupTimer?.Destroy();
                 
                 foreach (NetworkableId id in _powerlessDevices)
                 {
@@ -344,8 +364,8 @@ namespace Oxide.Plugins
                 _lastDamageWarn.Clear();
                 _lastDoorPulse.Clear();
                 _powerlessDevices.Clear();
+                _lastRespawnTime.Clear();
 
-                // Developer: Clean up SafeZone flag to prevent stuck state on unload
                 foreach (var player in BasePlayer.activePlayerList)
                 {
                     if (player?.HasPlayerFlag(BasePlayer.PlayerFlags.SafeZone) == true)
@@ -376,7 +396,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Inline permission checks with null safety for optimal performance
         private bool HasAdmin(BasePlayer player) => 
             player != null && permission.UserHasPermission(player.UserIDString, AdminPermission);
 
@@ -409,12 +428,14 @@ namespace Oxide.Plugins
 
         private void ValidateConfig()
         {
-            // Developer: Validate and normalize configuration values for safety
             _config.Settings.SpawnTimer = Mathf.Max(_config.Settings.SpawnTimer, 0.1f);
             _config.Settings.Radius = Mathf.Max(_config.Settings.Radius, 1f);
             _config.Settings.DoorOpenRadius = Mathf.Max(_config.Settings.DoorOpenRadius, 0.5f);
             _config.Settings.DoorOpenInterval = Mathf.Max(_config.Settings.DoorOpenInterval, 0.1f);
             _config.Settings.DoorCloseDelay = Mathf.Max(_config.Settings.DoorCloseDelay, 0.5f);
+            _config.Settings.RespawnCooldown = Mathf.Max(_config.Settings.RespawnCooldown, 0f);
+            if (_config.Settings.StandardItems == null || _config.Settings.StandardItems.Count == 0)
+                _config.Settings.StandardItems = new List<string> { "rock", "torch" };
         }
 
         protected override void LoadDefaultConfig() => _config = new PluginConfig();
@@ -573,12 +594,8 @@ namespace Oxide.Plugins
 
         private void CmdSpawn(BasePlayer player, string command, string[] args)
         {
-            if (player == null)
-            {
-                return;
-            }
+            if (player == null) return;
 
-            // Admin teleport to other player: /spawn <id|name>
             if (args.Length > 0 && HasAdmin(player))
             {
                 string targetId = args[0];
@@ -612,14 +629,12 @@ namespace Oxide.Plugins
                 return;
             }
 
-            // Allow sleeping bag respawns and restrict plugin teleportation on natural respawn
             if (player.IsHostile())
             {
                 SendMessage(player, Lang("CannotSpawnHostile"));
                 return;
             }
 
-            // Developer: Check for bypass permissions to skip delay
             float delay = (HasBypassTimer(player) || HasAdmin(player)) ? 0f : _config.Settings.SpawnTimer;
 
             if (delay > 0)
@@ -652,7 +667,6 @@ namespace Oxide.Plugins
                     player.SendNetworkUpdate();
                 }
 
-                // Developer: Visual feedback for teleportation
                 Effect.server.Run("assets/prefabs/misc/transferable/effects/teleport.prefab", player.transform.position, Vector3.up);
                 player.Teleport(_spawnData.Position);
                 player.eyes.rotation = _spawnData.Rotation;
@@ -716,9 +730,8 @@ namespace Oxide.Plugins
 
         private void CmdWS(BasePlayer player, string command, string[] args)
         {
-            if (player == null) return; 
+            if (player == null) return;
 
-            //Puts($"CmdWS called by {player.displayName} with args: '{string.Join("', '", args)}' (count={args.Length})");
             if (args.Length == 0)
             {
                 ShowHelp(player);
@@ -742,10 +755,10 @@ namespace Oxide.Plugins
                         ShowStatus(player);
                         return;
                     case "set":
-                        HandleSetCommand(player, args);  
+                        HandleSetCommand(player, args);
                         return;
                     case "get":
-                        HandleGetCommand(player, args); 
+                        HandleGetCommand(player, args);
                         return;
                     case "help":
                         ShowHelp(player);
@@ -868,6 +881,25 @@ namespace Oxide.Plugins
                         else
                             _powerlessDeviceTimer?.Destroy();
                         return true;
+                    case "respawncooldown":
+                        _config.Settings.RespawnCooldown = float.Parse(value);
+                        return true;
+                    case "removeemptycorpses":
+                        _config.Settings.RemoveEmptyCorpses = bool.Parse(value);
+                        if (_config.Settings.RemoveEmptyCorpses)
+                            StartCorpseCleanupTimer();
+                        else
+                            _corpseCleanupTimer?.Destroy();
+                        return true;
+                    case "standarditems":
+                        var items = value.Split(',').Select(s => s.Trim().ToLower()).Where(s => !string.IsNullOrEmpty(s)).ToList();
+                        if (items.Count == 0)
+                        {
+                            error = "At least one item required";
+                            return false;
+                        }
+                        _config.Settings.StandardItems = items;
+                        return true;
                     default:
                         error = "Unknown option";
                         return false;
@@ -896,6 +928,12 @@ namespace Oxide.Plugins
                     return _config.Settings.PreventBuildingDecay.ToString();
                 case "powerlessdevices":
                     return _config.Settings.PowerlessDevicesEnabled.ToString();
+                case "respawncooldown":
+                    return _config.Settings.RespawnCooldown.ToString();
+                case "removeemptycorpses":
+                    return _config.Settings.RemoveEmptyCorpses.ToString();
+                case "standarditems":
+                    return string.Join(",", _config.Settings.StandardItems);
                 default:
                     return "Unknown option";
             }
@@ -910,7 +948,8 @@ namespace Oxide.Plugins
                 cfg.SpawnTimer,
                 cfg.RespawnOnlyByCommand ? "Yes" : "No",
                 cfg.PreventBuildingDecay ? "Yes" : "No",
-                cfg.PowerlessDevicesEnabled ? "Yes" : "No");
+                cfg.PowerlessDevicesEnabled ? "Yes" : "No",
+                cfg.RespawnCooldown);
             SendMessage(player, status);
         }
 
@@ -939,6 +978,9 @@ namespace Oxide.Plugins
             SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRespawnOnlyCmd"), cfg.RespawnOnlyByCommand ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
             SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigPreventDecay"), cfg.PreventBuildingDecay ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
             SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigPowerlessDevices"), cfg.PowerlessDevicesEnabled ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRespawnCooldown"), cfg.RespawnCooldown));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigRemoveEmptyCorpses"), cfg.RemoveEmptyCorpses ? "<color=#00ff00>ON</color>" : "<color=#ff0000>OFF</color>"));
+            SendMessage(player, string.Format(Lang("ConfigLine"), Lang("ConfigStandardItems"), string.Join(", ", cfg.StandardItems)));
             SendMessage(player, Lang("ConfigHelp"));
         }
 
@@ -970,12 +1012,31 @@ namespace Oxide.Plugins
             if (!player.IsConnected || player.IsDead())
                 return;
 
+            // Prevent /respawn while in spawn zone
+            if (IsInSpawnZone(player.transform.position))
+            {
+                SendMessage(player, Lang("RespawnNotAllowedInZone"));
+                return;
+            }
+
+            // Cooldown check
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            if (_lastRespawnTime.TryGetValue(player.userID, out float lastTime))
+            {
+                float remaining = _config.Settings.RespawnCooldown - (now - lastTime);
+                if (remaining > 0)
+                {
+                    SendMessage(player, string.Format(Lang("RespawnCooldown"), Mathf.CeilToInt(remaining)));
+                    return;
+                }
+            }
+            _lastRespawnTime[player.userID] = now;
+
             try
             {
                 _respawnCommandFlag.Add(player.userID);
                 player.Die();
 
-                // Developer: Force respawn if automatic respawn fails
                 timer.Once(0.1f, () =>
                 {
                     if (player?.IsConnected == true && player.IsDead())
@@ -993,7 +1054,6 @@ namespace Oxide.Plugins
 
         #region Hooks
 
-        // Developer: Handle player spawn and reconnection logic
         private void OnPlayerConnected(BasePlayer player)
         {
             if (player == null || !_config.Settings.Enabled)
@@ -1061,7 +1121,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Save player position on logout for potential restore
         private void OnPlayerDisconnected(BasePlayer player, string reason)
         {
             if (player == null)
@@ -1075,6 +1134,7 @@ namespace Oxide.Plugins
                 _lastBuildWarn.Remove(player.userID);
                 _lastDamageWarn.Remove(player.userID);
                 _lastDoorPulse.Remove(player.userID);
+                _lastRespawnTime.Remove(player.userID);
 
                 if (!_config.Settings.Enabled || player.IsDead() || !_config.Settings.RestoreLogoutPositionOnReconnect)
                     return;
@@ -1092,7 +1152,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Handle respawn event - only force spawn on /respawn command, not on natural death
         private void OnPlayerRespawn(BasePlayer player)
         {
             if (player == null || !_config.Settings.Enabled)
@@ -1100,7 +1159,6 @@ namespace Oxide.Plugins
 
             try
             {
-                // Developer: Check if respawn was triggered by /respawn command
                 if (_respawnCommandFlag.Contains(player.userID))
                 {
                     _respawnCommandFlag.Remove(player.userID);
@@ -1118,12 +1176,9 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                // Developer: If RespawnOnlyByCommand is enabled, don't auto-respawn on natural death
-                // This allows players to use their sleeping bags naturally
                 if (_config.Settings.RespawnOnlyByCommand)
                     return;
 
-                // Developer: Legacy behavior - only for players without bypass
                 if (HasBypassSpawn(player) || HasAdmin(player))
                     return;
 
@@ -1146,7 +1201,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Prevent construction in safe zone before entity creation
         private object CanBuild(Planner plan, Construction prefab, Construction.Target target)
         {
             if (plan == null || !_config.Settings.Enabled || !_config.Settings.BlockBuildingInZone)
@@ -1175,7 +1229,6 @@ namespace Oxide.Plugins
             return null;
         }
 
-        // Developer: Catch deployables that slip through CanBuild check
         private void OnEntityBuilt(Planner plan, GameObject gameObject)
         {
             if (plan == null || gameObject == null || !_config.Settings.Enabled || !_config.Settings.BlockBuildingInZone)
@@ -1207,7 +1260,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Hard safe zone protection - no damage exceptions. Also prevents building decay
         private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
             if (entity == null || info == null || !_config.Settings.Enabled)
@@ -1218,7 +1270,6 @@ namespace Oxide.Plugins
                 if (!IsInSpawnZone(entity.transform.position))
                     return null;
 
-                // Developer: Block damage to players
                 if (entity is BasePlayer victim)
                 {
                     float now = UnityEngine.Time.realtimeSinceStartup;
@@ -1227,11 +1278,9 @@ namespace Oxide.Plugins
                     return false;
                 }
 
-                // Developer: Prevent building decay if option enabled
                 if (_config.Settings.PreventBuildingDecay && info?.Initiator == null && IsDecayDamage(info))
                     return false;
 
-                // Developer: Block all other damage in safe zone
                 return false;
             }
             catch (Exception ex)
@@ -1242,14 +1291,12 @@ namespace Oxide.Plugins
             return null;
         }
 
-        // Developer: Check if damage is from entity decay (when initiator is null)
         private bool IsDecayDamage(HitInfo info)
         {
             return info?.Initiator == null && info?.damageTypes != null && 
                    info.damageTypes.Get(Rust.DamageType.Decay) > 0;
         }
 
-        // Developer: Block looting of protected players
         private object CanLootPlayer(BasePlayer target, BasePlayer looter)
         {
             if (!_config.Settings.Enabled || !_config.Settings.BlockLootingInZone || target == null || looter == null)
@@ -1274,7 +1321,6 @@ namespace Oxide.Plugins
             return null;
         }
 
-        // Developer: Block looting of entities in safe zone
         private object CanLootEntity(BasePlayer looter, BaseEntity entity)
         {
             if (!_config.Settings.Enabled || !_config.Settings.BlockLootingInZone || looter == null || entity == null)
@@ -1309,7 +1355,53 @@ namespace Oxide.Plugins
             return null;
         }
 
-        // Developer: Per-tick zone management - flag sync, weapons holster, metabolism freeze, door assist
+        // NEW: Hook to handle loot end and remove empty corpses
+        private void OnLootEntityEnd(BasePlayer looter, BaseEntity entity)
+        {
+            if (!_config.Settings.Enabled || !_config.Settings.RemoveEmptyCorpses)
+                return;
+            if (looter == null || entity == null || entity.IsDestroyed)
+                return;
+
+            PlayerCorpse corpse = entity as PlayerCorpse;
+            if (corpse == null) return;
+
+            // Only process if the looter is the owner of the corpse
+            if (corpse.playerSteamID != looter.userID)
+                return;
+
+            try
+            {
+                // Check inventory contents
+                var container = corpse.containers?.FirstOrDefault(c => c?.allowedContents == ItemContainer.ContentsType.Generic);
+                if (container == null) return;
+
+                bool onlyStandardItems = true;
+                bool hasAnyItem = false;
+                foreach (var item in container.itemList)
+                {
+                    if (item == null) continue;
+                    hasAnyItem = true;
+                    string shortname = item.info?.shortname?.ToLowerInvariant();
+                    if (string.IsNullOrEmpty(shortname) || !_config.Settings.StandardItems.Contains(shortname))
+                    {
+                        onlyStandardItems = false;
+                        break;
+                    }
+                }
+
+                if (!hasAnyItem || onlyStandardItems)
+                {
+                    corpse.Kill();
+                    SendZoneMessage(looter, Lang("EmptyCorpseRemoved"));
+                }
+            }
+            catch (Exception ex)
+            {
+                PrintError($"OnLootEntityEnd error: {ex}");
+            }
+        }
+
         private object OnPlayerTick(BasePlayer player, PlayerTick msg, bool wasPlayerStalled)
         {
             if (player == null || !_config.Settings.Enabled || !_spawnData.IsSet || !player.IsConnected || player.IsDead())
@@ -1326,7 +1418,6 @@ namespace Oxide.Plugins
                     {
                         _inZoneTracker.Add(player.userID);
                         SendZoneMessage(player, Lang("EnteredSafeZone"));
-                        // Enable powerless devices for this player if configured
                         if (_config.Settings.PowerlessDevicesEnabled)
                             TryEnableNearbyDevices(player);
                     }
@@ -1351,7 +1442,6 @@ namespace Oxide.Plugins
                         player.SetPlayerFlag(BasePlayer.PlayerFlags.SafeZone, false);
 
                     SendZoneMessage(player, Lang("LeaveSafeZone"));
-                    // Disable devices when player leaves
                     if (_config.Settings.PowerlessDevicesEnabled)
                         DisableDevicesNearby(player);
                 }
@@ -1372,7 +1462,6 @@ namespace Oxide.Plugins
 
         #region Helpers
 
-        // Developer: Fast zone boundary check with early return
         private bool IsInSpawnZone(Vector3 position)
         {
             if (!_spawnData.IsSet)
@@ -1381,7 +1470,6 @@ namespace Oxide.Plugins
             return Vector3.Distance(position, _spawnData.Position) <= _config.Settings.Radius;
         }
 
-        // Developer: Periodic metabolism freeze for in-zone players
         private void StartZoneEffectsTimer()
         {
             if (_zoneTimer != null) 
@@ -1408,7 +1496,6 @@ namespace Oxide.Plugins
             });
         }
 
-        // Developer: Freeze all metabolism parameters to prevent starvation in zone
         private void ApplyMetabolismFreeze(BasePlayer player)
         {
             try
@@ -1431,14 +1518,12 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Force-holster restricted items for zone security
         private void EnforceNoWeapons(BasePlayer player)
         {
             try
             {
                 if (player == null) return;
 
-                // Developers: Admins should be able to use weapons regardless of zone
                 if (HasAdmin(player))
                     return;
 
@@ -1458,7 +1543,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Check if item belongs to restricted category
         private static bool IsRestrictedItem(Item item)
         {
             if (item?.info == null)
@@ -1467,7 +1551,6 @@ namespace Oxide.Plugins
             return item.info.category == ItemCategory.Weapon || item.info.category == ItemCategory.Tool;
         }
 
-        // Developer: Close all initially open doors in spawn zone
         private void CloseAllDoorsInZone()
         {
             if (!_spawnData.IsSet || !_config.Settings.AutoOpenDoorsInZone)
@@ -1500,7 +1583,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Periodic door monitor - keep doors closed when no players nearby
         private void StartDoorMonitorTimer()
         {
             if (_doorTimer != null) 
@@ -1531,7 +1613,6 @@ namespace Oxide.Plugins
 
                         processedDoors.Add(door);
 
-                        // Developer: Check for nearby living players using Physics.OverlapSphere on Player layer
                         Collider[] doorColliders = Physics.OverlapSphere(door.transform.position, checkRadius, 1 << 17, QueryTriggerInteraction.Collide);
                         bool playerNearby = false;
 
@@ -1559,7 +1640,6 @@ namespace Oxide.Plugins
             });
         }
 
-        // Developer: Open nearby doors for zone player convenience
         private void TryOpenNearbyDoors(BasePlayer player)
         {
             if (player == null || !_config.Settings.AutoOpenDoorsInZone)
@@ -1591,7 +1671,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Enable nearby devices for player convenience inside zone
         private void TryEnableNearbyDevices(BasePlayer player)
         {
             if (player == null || !_config.Settings.PowerlessDevicesEnabled)
@@ -1640,7 +1719,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Try invoking a named method by reflection as a fallback
         private void TryInvokeMethod(object target, string methodName, params object[] args)
         {
             if (target == null || string.IsNullOrEmpty(methodName)) return;
@@ -1655,12 +1733,10 @@ namespace Oxide.Plugins
             }
             catch (Exception ex)
             {
-                // Swallow errors silently but log for debugging
                 PrintError($"Reflection invoke {methodName} failed on {target.GetType().Name}: {ex.Message}");
             }
         }
 
-        // Developer: Disable devices previously enabled for this player/zone
         private void DisableDevicesNearby(BasePlayer player)
         {
             if (!_config.Settings.PowerlessDevicesEnabled) return;
@@ -1702,7 +1778,7 @@ namespace Oxide.Plugins
                 PrintError($"DisableDevicesNearby error: {ex}");
             }
         }
-        // Developer: Throttled warning for loot attempts
+
         private void WarnLootBlocked(BasePlayer player)
         {
             if (player == null)
@@ -1713,7 +1789,6 @@ namespace Oxide.Plugins
                 SendZoneMessage(player, Lang("LootBlocked"));
         }
 
-        // Developer: Throttled warning for build attempts
         private void WarnBuildBlocked(BasePlayer player)
         {
             if (player == null)
@@ -1724,7 +1799,6 @@ namespace Oxide.Plugins
                 SendZoneMessage(player, Lang("BuildingBlocked"));
         }
 
-        // Developer: Cooldown check to avoid chat spam
         private bool TryWarn(Dictionary<ulong, float> storage, ulong userId, float now, float cooldown)
         {
             if (storage == null)
@@ -1737,26 +1811,21 @@ namespace Oxide.Plugins
             return true;
         }
 
-        // Developer: Find player by steamid, userid or partial nickname
         private BasePlayer FindPlayerByIdentifier(string ident)
         {
             if (string.IsNullOrEmpty(ident)) return null;
-            // Try SteamID
             if (ulong.TryParse(ident, out ulong id))
                 return BasePlayer.FindByID(id);
 
-            // By partial name (first match)
             var match = BasePlayer.activePlayerList
                 .Where(p => p != null && !string.IsNullOrEmpty(p.displayName) && p.displayName.IndexOf(ident, StringComparison.OrdinalIgnoreCase) >= 0)
                 .FirstOrDefault();
 
             if (match != null) return match;
 
-            // By UserIDString exact
             return BasePlayer.activePlayerList.FirstOrDefault(p => p != null && p.UserIDString == ident);
         }
 
-        // Developer: Auto-locate spawn at Outpost or Bandit if not manually set
         private void TryFindDefaultSpawn()
         {
             try
@@ -1768,7 +1837,6 @@ namespace Oxide.Plugins
                 GameObject obj = GameObject.Find(prefabName);
                 if (obj == null && _config.Settings.FindOutpostFirst)
                 {
-                    // Fallback to Bandit if Outpost not found
                     obj = GameObject.Find("assets/bundled/prefabs/static/bandit_town.prefab");
                 }
 
@@ -1794,7 +1862,6 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Send chat message to player with plugin prefix
         private void SendMessage(BasePlayer player, string message)
         {
             if (player == null || string.IsNullOrEmpty(message))
@@ -1811,14 +1878,12 @@ namespace Oxide.Plugins
             }
         }
 
-        // Developer: Send zone-conditional message (respects ChatNotificationsEnabled setting)
         private void SendZoneMessage(BasePlayer player, string message)
         {
             if (_config.Settings.ChatNotificationsEnabled)
                 SendMessage(player, message);
         }
 
-        // Developer: Localization lookup with optional formatting
         private string Lang(string key, params object[] args)
         {
             string msg = lang.GetMessage(key, this);
@@ -1827,8 +1892,83 @@ namespace Oxide.Plugins
             return msg;
         }
 
-        // Developer: Print initialization banner with plugin status
-        // Developer: Periodic powerless device power-up system - allows certain devices to work without external power
+        private void PrintBanner()
+        {
+            Puts("==================================================");
+            Puts($"{Name} loaded successfully.");
+            Puts($"Version: {PluginVersion}");
+            Puts($"Spawn set: {_spawnData.IsSet}, Radius: {_config.Settings.Radius}, Timer: {_config.Settings.SpawnTimer}s");
+            Puts($"Decay prevention: {_config.Settings.PreventBuildingDecay}, Powerless devices: {_config.Settings.PowerlessDevicesEnabled}, Respawn by command only: {_config.Settings.RespawnOnlyByCommand}");
+            Puts($"Respawn cooldown: {_config.Settings.RespawnCooldown}s, Remove empty corpses: {_config.Settings.RemoveEmptyCorpses}");
+            Puts("==================================================");
+        }
+
+        // NEW: Periodic cleanup of corpses in spawn zone that are empty or only contain standard items
+        private void StartCorpseCleanupTimer()
+        {
+            if (_corpseCleanupTimer != null)
+                return;
+
+            _corpseCleanupTimer = timer.Every(10f, () =>
+            {
+                try
+                {
+                    if (!_config.Settings.Enabled || !_config.Settings.RemoveEmptyCorpses || !_spawnData.IsSet)
+                        return;
+
+                    // Find all corpses in the spawn zone
+                    Collider[] colliders = Physics.OverlapSphere(_spawnData.Position, _config.Settings.Radius, ~0, QueryTriggerInteraction.Collide);
+                    if (colliders?.Length == 0)
+                        return;
+
+                    var processed = new HashSet<PlayerCorpse>();
+
+                    foreach (Collider collider in colliders)
+                    {
+                        if (collider == null) continue;
+                        PlayerCorpse corpse = collider.GetComponentInParent<PlayerCorpse>();
+                        if (corpse == null || corpse.IsDestroyed || processed.Contains(corpse))
+                            continue;
+
+                        processed.Add(corpse);
+
+                        // Check if corpse is in the zone (already ensured by overlap)
+                        if (!IsInSpawnZone(corpse.transform.position))
+                            continue;
+
+                        // Check inventory
+                        var container = corpse.containers?.FirstOrDefault(c => c?.allowedContents == ItemContainer.ContentsType.Generic);
+                        if (container == null) continue;
+
+                        bool onlyStandard = true;
+                        bool hasAny = false;
+                        foreach (var item in container.itemList)
+                        {
+                            if (item == null) continue;
+                            hasAny = true;
+                            string shortname = item.info?.shortname?.ToLowerInvariant();
+                            if (string.IsNullOrEmpty(shortname) || !_config.Settings.StandardItems.Contains(shortname))
+                            {
+                                onlyStandard = false;
+                                break;
+                            }
+                        }
+
+                        if (!hasAny || onlyStandard)
+                        {
+                            corpse.Kill();
+                            // Notify nearby players? Could spam, so we skip.
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Corpse cleanup timer error: {ex}");
+                }
+            });
+        }
+
+        // NEW: Start powerless device timer (already exists, kept)
         private void StartPowerlessDeviceTimer()
         {
             if (_powerlessDeviceTimer != null) 
@@ -1860,7 +2000,6 @@ namespace Oxide.Plugins
 
                         string shortName = entity.ShortPrefabName?.ToLowerInvariant();
 
-                        // Power up devices without requiring external power
                         if (shortName == "electric.heater" || shortName == "electricheater" || shortName == "autoturret" || shortName == "searchlight")
                         {
                             IOEntity ioEntity = entity as IOEntity;
@@ -1874,7 +2013,6 @@ namespace Oxide.Plugins
 
                             int powerNeeded = Mathf.Max(ioEntity.ConsumptionAmount(), 10);
                             
-                            // If the device has lost power or it has turned off, turn on the power again.
                             if (ioEntity.currentEnergy < powerNeeded || !ioEntity.HasFlag(BaseEntity.Flags.On))
                             {
                                 ioEntity.currentEnergy = powerNeeded;
@@ -1889,7 +2027,6 @@ namespace Oxide.Plugins
                         }
                     }
 
-                    // Turning off devices that have been removed from the spawn zone
                     var devicesToRemove = new HashSet<NetworkableId>();
                     foreach (NetworkableId deviceId in _powerlessDevices)
                     {
@@ -1919,16 +2056,6 @@ namespace Oxide.Plugins
                     PrintError($"Powerless device timer error: {ex}");
                 }
             });
-        }
-
-        private void PrintBanner()
-        {
-            Puts("==================================================");
-            Puts($"{Name} loaded successfully.");
-            Puts($"Version: {PluginVersion}");
-            Puts($"Spawn set: {_spawnData.IsSet}, Radius: {_config.Settings.Radius}, Timer: {_config.Settings.SpawnTimer}s");
-            Puts($"Decay prevention: {_config.Settings.PreventBuildingDecay}, Powerless devices: {_config.Settings.PowerlessDevicesEnabled}, Respawn by command only: {_config.Settings.RespawnOnlyByCommand}");
-            Puts("==================================================");
         }
 
         #endregion
